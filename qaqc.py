@@ -18,25 +18,26 @@ import sys
 import traceback
 from datetime import datetime
 
-from PyQt5 import QtWidgets, uic
-from PyQt5.QtCore import QRegularExpression, Qt
-from PyQt5.QtGui import QBrush, QColor, QFont, QRegularExpressionValidator
-from PyQt5.QtWidgets import (QApplication, QFileDialog, QMainWindow,
-                             QMessageBox, QTableWidgetItem)
+# En el .exe sin consola (--windowed) sys.stdout/stderr son None y cualquier
+# print o traceback haria fallar la aplicacion.
+for _flujo in ("stdout", "stderr"):
+    if getattr(sys, _flujo) is None:
+        setattr(sys, _flujo, open(os.devnull, "w"))
 
-from matplotlib.figure import Figure
-try:
-    from matplotlib.backends.backend_qtagg import (
-        FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar)
-except ImportError:  # matplotlib < 3.5
-    from matplotlib.backends.backend_qt5agg import (
-        FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar)
+from PyQt5 import QtWidgets  # noqa: E402
+from PyQt5.QtCore import (QObject, QRegularExpression, QRunnable, Qt,  # noqa: E402
+                          QThreadPool, pyqtSignal)
+from PyQt5.QtGui import QBrush, QColor, QFont, QRegularExpressionValidator  # noqa: E402
+from PyQt5.QtWidgets import (QApplication, QCompleter, QFileDialog,  # noqa: E402
+                             QMainWindow, QMessageBox, QTableWidgetItem)
 
-import pandas as pd
+import pandas as pd  # noqa: E402
 
-import qaqc_calc as calc
-import qaqc_config as cfg
-import qaqc_plots as plots
+import qaqc_calc as calc  # noqa: E402
+import qaqc_config as cfg  # noqa: E402
+
+# matplotlib y los graficos se importan recien al abrir el primer grafico
+# (_modulos_graficos): asi la ventana principal abre ~0.8 s antes.
 
 
 def _ruta_recurso(nombre):
@@ -46,12 +47,36 @@ def _ruta_recurso(nombre):
     return os.path.join(base, nombre)
 
 
-Ui_MainWindow, _ = uic.loadUiType(_ruta_recurso("qaqcbs.ui"))
+try:  # interfaz compilada con pyuic5 (la que usa el .exe)
+    from ui_qaqcbs import Ui_ModuloQAQC as Ui_MainWindow
+except ImportError:  # en desarrollo, si no se compilo, se lee el .ui
+    from PyQt5 import uic
+    Ui_MainWindow, _ = uic.loadUiType(_ruta_recurso("qaqcbs.ui"))
 
 FILTRO_EXCEL = "Archivos Excel (*.xlsx *.xlsm *.xls)"
 COLOR_CLASE = {"ACEPTABLE": "green", "CUESTIONABLE": "orange",
                "INACEPTABLE": "red", "No Certificado": "black", "Sin datos": "gray"}
 GRIS = QColor("lightgray")
+ARCHIVO_ERRORES = os.path.join(os.path.expanduser("~"), "QAQC_errores.log")
+
+
+@functools.lru_cache(maxsize=None)
+def _modulos_graficos():
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_qt5agg import (FigureCanvasQTAgg,
+                                                    NavigationToolbar2QT)
+    import qaqc_plots
+    return Figure, FigureCanvasQTAgg, NavigationToolbar2QT, qaqc_plots
+
+
+class _GraficosPerezosos:
+    """`plots.funcion` importa qaqc_plots (y matplotlib) la primera vez."""
+
+    def __getattr__(self, nombre):
+        return getattr(_modulos_graficos()[3], nombre)
+
+
+plots = _GraficosPerezosos()
 
 
 def accion(titulo_error):
@@ -66,16 +91,33 @@ def accion(titulo_error):
                     return funcion(self, *args)
                 finally:
                     QApplication.restoreOverrideCursor()
-            except PermissionError as e:
-                self.log(f"{titulo_error}: {e}", error=True)
-                QMessageBox.critical(self, titulo_error,
-                                     f"{e}\n\nRevisar que el archivo no este abierto en Excel.")
             except Exception as e:  # noqa: BLE001 - se informa al usuario
-                self.log(f"{titulo_error}: {e}", error=True)
-                traceback.print_exc()
-                QMessageBox.critical(self, titulo_error, str(e))
+                self.mostrar_error(titulo_error, e, traceback.format_exc())
         return envoltura
     return decorador
+
+
+class _Senales(QObject):
+    terminado = pyqtSignal(object)
+    fallo = pyqtSignal(object, str)
+
+
+class Tarea(QRunnable):
+    """Ejecuta una funcion en segundo plano (lectura de Excel, procesamiento)
+    para que la ventana no quede 'No responde'."""
+
+    def __init__(self, funcion):
+        super().__init__()
+        self.funcion = funcion
+        self.senales = _Senales()
+
+    def run(self):
+        try:
+            resultado = self.funcion()
+        except Exception as e:  # noqa: BLE001 - se reenvia al hilo principal
+            self.senales.fallo.emit(e, traceback.format_exc())
+        else:
+            self.senales.terminado.emit(resultado)
 
 
 class VentanaGraficos(QtWidgets.QWidget):
@@ -92,6 +134,7 @@ class VentanaGraficos(QtWidgets.QWidget):
         QtWidgets.QVBoxLayout(self).addWidget(self.tabs)
 
     def agregar(self, nombre, fig):
+        NavigationToolbar = _modulos_graficos()[2]
         pagina = QtWidgets.QWidget()
         capa = QtWidgets.QVBoxLayout(pagina)
         capa.addWidget(NavigationToolbar(fig.canvas, pagina))
@@ -155,6 +198,20 @@ class MyApp(QMainWindow, Ui_MainWindow):
             # lambda: descarta el argumento 'checked' que envia clicked
             boton.clicked.connect(lambda _=False, s=slot: s())
         self.actionAcerca.triggered.connect(self.acerca_de)
+
+        # Malla (~800 valores) y Scheme (~1100): combos con busqueda por texto
+        for combo in (self.VMalla, self.VLote):
+            combo.setEditable(True)
+            combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+            combo.completer().setFilterMode(Qt.MatchContains)
+            combo.completer().setCompletionMode(QCompleter.PopupCompletion)
+
+        self._tareas = set()
+        self.progreso = QtWidgets.QProgressBar()
+        self.progreso.setRange(0, 0)          # barra "ocupado"
+        self.progreso.setMaximumWidth(180)
+        self.progreso.hide()
+        self.statusbar.addPermanentWidget(self.progreso)
         self._mostrar_carpeta()
         self.log("Seleccione la BD de Leyes para comenzar.")
 
@@ -165,6 +222,49 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.Log.appendHtml(f'<span style="color:gray">{hora}</span> '
                             f'<span style="color:{color}">{mensaje}</span>')
         self.statusbar.showMessage(mensaje, 8000)
+
+    def mostrar_error(self, titulo, error, detalle=""):
+        mensaje = str(error)
+        if isinstance(error, PermissionError):
+            mensaje += "\n\nRevisar que el archivo no este abierto en Excel."
+        self.log(f"{titulo}: {error}", error=True)
+        try:  # el detalle tecnico va a un archivo (en el .exe no hay consola)
+            with open(ARCHIVO_ERRORES, "a", encoding="utf-8") as f:
+                f.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {titulo}\n{detalle}")
+        except OSError:
+            pass
+        QMessageBox.critical(self, titulo, mensaje)
+
+    def en_segundo_plano(self, mensaje, funcion, al_terminar, titulo_error):
+        """Ejecuta `funcion` en otro hilo y luego `al_terminar(resultado)` en
+        el hilo de la interfaz. Mientras tanto la ventana queda bloqueada."""
+        tarea = Tarea(funcion)
+        self._tareas.add(tarea)
+
+        def fin():
+            self._tareas.discard(tarea)
+            self.tabWidget.setEnabled(True)
+            self.progreso.hide()
+            QApplication.restoreOverrideCursor()
+
+        def ok(resultado):
+            fin()
+            try:
+                al_terminar(resultado)
+            except Exception as e:  # noqa: BLE001
+                self.mostrar_error(titulo_error, e, traceback.format_exc())
+
+        def error(e, detalle):
+            fin()
+            self.mostrar_error(titulo_error, e, detalle)
+
+        tarea.senales.terminado.connect(ok)
+        tarea.senales.fallo.connect(error)
+        self.tabWidget.setEnabled(False)
+        self.progreso.show()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.log(mensaje)
+        QThreadPool.globalInstance().start(tarea)
 
     def acerca_de(self):
         QMessageBox.about(self, "Acerca de", "Modulo QAQC\n\n"
@@ -197,8 +297,14 @@ class MyApp(QMainWindow, Ui_MainWindow):
         return vmin, vmax
 
     @staticmethod
-    def _filtro(combo):
-        return combo.currentText() if combo.currentIndex() > 0 else None
+    def _filtro(combo, nombre):
+        texto = combo.currentText().strip()
+        if not texto or texto == combo.itemText(0):
+            return None
+        indice = combo.findText(texto, Qt.MatchFixedString)
+        if indice < 0:
+            raise ValueError(f"{nombre} '{texto}' no existe en el Reporte de Muestras QAQC.")
+        return combo.itemText(indice)
 
     # ---------------------------------------------------------------- tablas
     @staticmethod
@@ -238,15 +344,24 @@ class MyApp(QMainWindow, Ui_MainWindow):
             self.llenar_tabla(tabla, r[hoja], gris_primera=False)
 
     # ------------------------------------------------------- importacion
-    @accion("Error al cargar el archivo")
+    @staticmethod
+    def _leer(lector, ruta, hoja):
+        try:
+            return lector(ruta)
+        except ValueError as e:
+            if "not found" in str(e) or "Worksheet" in str(e):
+                raise ValueError(f"El excel seleccionado debe tener la hoja '{hoja}'.") from e
+            raise
+
     def importar_leyes(self):
         ruta = self._abrir_excel("Seleccionar archivo BD Leyes")
-        if not ruta:
-            return
-        try:
-            bd = calc.leer_bd_leyes(ruta)
-        except ValueError as e:
-            raise ValueError(f"{e}\nEl excel seleccionado debe tener la hoja 'General'.")
+        if ruta:
+            self.en_segundo_plano(
+                f"Leyendo {os.path.basename(ruta)}...",
+                lambda: self._leer(calc.leer_bd_leyes, ruta, "General"),
+                lambda bd: self._leyes_cargadas(ruta, bd), "Error al cargar el archivo")
+
+    def _leyes_cargadas(self, ruta, bd):
         ids = pd.to_numeric(bd.get("SAMPLE_ID"), errors="coerce").dropna()
         if ids.empty:
             raise ValueError("La hoja 'General' no tiene la columna SAMPLE_ID con valores numericos.")
@@ -258,35 +373,59 @@ class MyApp(QMainWindow, Ui_MainWindow):
             self.carpeta_salida = os.path.join(os.path.dirname(ruta), "Resultados_QAQC")
             self._mostrar_carpeta()
         self.BDQaqc.setEnabled(True)
+        self.PROC.setEnabled(self.bd_sec is not None)
+        self._actualizar_filtros()
         self.log(f"BD con Leyes importada ({len(bd)} filas). Cargue el Reporte de Muestras QAQC.")
 
-    @accion("Error al cargar el archivo")
     def importar_reporte(self):
         ruta = self._abrir_excel("Seleccionar archivo Reporte de Muestras QAQC")
-        if not ruta:
-            return
-        try:
-            bd = calc.leer_reporte_qaqc(ruta)
-        except ValueError as e:
-            raise ValueError(f"{e}\nEl excel seleccionado debe tener la hoja 'LEYES SGS'.")
+        if ruta:
+            self.en_segundo_plano(
+                f"Leyendo {os.path.basename(ruta)} (puede tardar unos segundos)...",
+                lambda: self._leer(calc.leer_reporte_qaqc, ruta, "LEYES SGS"),
+                lambda bd: self._reporte_cargado(ruta, bd), "Error al cargar el archivo")
+
+    def _reporte_cargado(self, ruta, bd):
         self.bd_sec = bd
         self.lblQaqc.setText(os.path.basename(ruta))
+        self._actualizar_filtros()
+        self.PROC.setEnabled(self.bd_ini is not None)
+        self.log(f"Reporte de Muestras QAQC importado ({len(bd)} filas). Revise el rango y "
+                 "los filtros y presione 'Procesar Datos'.")
+
+    def _actualizar_filtros(self):
+        """Mallas y reportes que tienen muestras en la BD de Leyes cargada."""
+        if self.bd_ini is None or self.bd_sec is None:
+            return
+        ids = pd.to_numeric(self.bd_ini["SAMPLE_ID"], errors="coerce")
+        sec = self.bd_sec[pd.to_numeric(self.bd_sec["SAMPLE_ID"], errors="coerce").isin(ids)]
         for combo, columna, todos in ((self.VMalla, "Malla", "(Todas)"),
                                       (self.VLote, "Scheme", "(Todos)")):
             combo.clear()
-            combo.addItems([todos, *calc.opciones_filtro(bd, columna)])
-        self.PROC.setEnabled(True)
-        self.log("Reporte de Muestras QAQC importado. Revise el rango y los filtros y "
-                 "presione 'Procesar Datos'.")
+            combo.addItems([todos, *calc.opciones_filtro(sec, columna)])
 
     @accion("Error en el procesamiento")
     def procesar(self):
         vmin, vmax = self._rango()
-        malla, reporte = self._filtro(self.VMalla), self._filtro(self.VLote)
-        bd_total, avisos = calc.unir_bases(self.bd_ini, self.bd_sec, vmin, vmax, malla, reporte)
+        malla = self._filtro(self.VMalla, "La malla")
+        reporte = self._filtro(self.VLote, "El reporte")
+        bd_ini, bd_sec = self.bd_ini, self.bd_sec
+
+        def calcular():
+            bd_total, avisos = calc.unir_bases(bd_ini, bd_sec, vmin, vmax, malla, reporte)
+            return calc.ResultadosQAQC(bd_total), avisos
+
+        filtros = [f"rango {vmin} - {vmax}"]
+        filtros += [f"malla {malla}"] if malla else []
+        filtros += [f"reporte {reporte}"] if reporte else []
+        self.en_segundo_plano("Procesando...", calcular,
+                              lambda r: self._procesado(*r, ", ".join(filtros)),
+                              "Error en el procesamiento")
+
+    def _procesado(self, res, avisos, filtros):
         for aviso in avisos:
             self.log(f"Aviso: {aviso}", error=True)
-        self.res = calc.ResultadosQAQC(bd_total)
+        self.res = res
         self._llenar_tablas_qaqc()
         for boton in self.botones_qaqc:
             boton.setEnabled(True)
@@ -296,12 +435,14 @@ class MyApp(QMainWindow, Ui_MainWindow):
             boton.setEnabled(False)
         self.ProcRMA.setEnabled(self.bd_cert is not None)
 
-        filtros = [f"rango {vmin} - {vmax}"]
-        filtros += [f"malla {malla}"] if malla else []
-        filtros += [f"reporte {reporte}"] if reporte else []
-        conteo = ", ".join(f"{k}: {v}" for k, v in self.res.conteo_controles().items())
-        self.log(f"Procesado ({', '.join(filtros)}): {len(bd_total)} muestras. "
-                 f"Controles -> {conteo or 'ninguno'}.")
+        conteo = self.res.conteo_controles()
+        resumen = ", ".join(f"{k}: {v}" for k, v in conteo.items())
+        self.log(f"Procesado ({filtros}): {len(res.bd_total)} muestras. "
+                 f"Controles -> {resumen or 'ninguno'}.")
+        sin_parametros = [c for c in conteo.index if c not in calc.CONTROLES_CONOCIDOS]
+        if sin_parametros:
+            self.log(f"Controles sin parametros en qaqc_config.py (no se evaluan): "
+                     f"{', '.join(map(str, sin_parametros))}")
 
     @accion("No se creo el reporte")
     def exportar_reporte(self):
@@ -312,6 +453,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
     # -------------------------------------------------------------- graficos
     def _mostrar(self, titulo, graficos):
         """graficos: lista de (pestana, archivo_png, figsize, dibujar(fig))."""
+        Figure, FigureCanvas = _modulos_graficos()[:2]
         guardar = self.chkGuardarPNG.isChecked()
         carpeta = self._carpeta() if guardar else None
         ventana = VentanaGraficos(titulo, self)
@@ -406,12 +548,16 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self._mostrar("Historico por Mes - Blancos y Estandares", graficos)
 
     # ------------------------------------------------------ control externo
-    @accion("Error al cargar el archivo")
     def importar_externo(self):
         ruta = self._abrir_excel("Seleccionar reporte del laboratorio externo")
-        if not ruta:
-            return
-        self.bd_cert = calc.leer_reporte_externo(ruta)
+        if ruta:
+            self.en_segundo_plano(f"Leyendo {os.path.basename(ruta)}...",
+                                  lambda: calc.leer_reporte_externo(ruta),
+                                  lambda bd: self._externo_cargado(ruta, bd),
+                                  "Error al cargar el archivo")
+
+    def _externo_cargado(self, ruta, bd):
+        self.bd_cert = bd
         self.lblRMA.setText(os.path.basename(ruta))
         self.ProcRMA.setEnabled(self.res is not None)
         self.log("Reporte de muestras externas importado."

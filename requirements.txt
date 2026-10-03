@@ -1,7 +1,8 @@
 PyQt5>=5.15
-pandas>=1.5
+pandas>=2.2
 numpy>=1.23
 matplotlib>=3.5
 mplcursors>=0.5
+python-calamine>=0.2
 openpyxl>=3.0
 xlsxwriter>=3.0

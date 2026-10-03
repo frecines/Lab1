@@ -21,6 +21,36 @@ python qaqc.py
 3. Los PNG (300 dpi) y los Excel se guardan en la **carpeta de salida**
    (por defecto `Resultados_QAQC`, junto a la BD de Leyes). Guardar los PNG es opcional.
 
+## Ejecutable (PyInstaller)
+
+En Windows, doble clic en **`build_exe.bat`** (instala dependencias, recompila la
+interfaz y ejecuta `pyinstaller qaqc.spec`). Resultado: `dist\ModuloQAQC\ModuloQAQC.exe`;
+se distribuye **la carpeta `dist\ModuloQAQC` completa**.
+
+- Por defecto se compila en modo carpeta, que abre más rápido. El modo de un solo archivo
+  (`UN_SOLO_ARCHIVO = True` en `qaqc.spec`) es más cómodo de copiar, pero en cada
+  inicio descomprime todo el paquete (más de 100 MB) en una carpeta temporal y tarda
+  bastante más en abrir.
+- Para un icono propio, colocar `qaqc.ico` junto a `qaqc.spec`.
+- Si se modifica `qaqcbs.ui` en Qt Designer, `build_exe.bat` regenera `ui_qaqcbs.py`
+  (o manualmente: `python -m PyQt5.uic.pyuic qaqcbs.ui -o ui_qaqcbs.py`).
+- Los errores técnicos (el .exe no tiene consola) se guardan en
+  `%USERPROFILE%\QAQC_errores.log`.
+
+### Optimizaciones para el ejecutable
+
+| | Antes | Ahora |
+|---|---|---|
+| Lectura del Reporte QAQC (19 MB, 83.000 filas) | 12,8 s, ventana "No responde" | ~3 s (lector `calamine`, sólo 6 columnas), en segundo plano con barra de progreso |
+| Importaciones al iniciar | 1,3 s | 0,3 s (matplotlib se carga al abrir el primer gráfico; interfaz precompilada) |
+| `.ui` | leído en tiempo de ejecución desde la carpeta actual | compilado a `ui_qaqcbs.py` (no depende de archivos externos) |
+| Errores sin consola | `traceback.print_exc()` con `sys.stderr = None` hacía fallar el .exe | se escriben en `QAQC_errores.log` |
+| Dependencias | incluía `statsmodels` (+ scipy, ~100 MB) | eliminadas; `qaqc.spec` excluye tkinter, scipy, QtWebEngine, QML, etc. |
+
+Compilación y ejecución verificadas en Linux con PyInstaller 6 y los archivos reales
+(`BD_20241225.xlsx` y `00- REPORTE DE MUESTRAS QAQC-2024.xlsx`); el .exe de Windows
+debe compilarse en Windows.
+
 ## Estructura
 
 | Archivo | Contenido |
@@ -30,6 +60,8 @@ python qaqc.py
 | `qaqc_calc.py` | Lectura, unión, cálculos y reportes (sin Qt, se puede usar desde scripts) |
 | `qaqc_plots.py` | Una función por tipo de gráfico |
 | `qaqc_config.py` | **Parámetros**: límites de detección, medias históricas, valores certificados, desviaciones, pendientes, umbrales de clasificación y fecha límite |
+| `ui_qaqcbs.py` | Interfaz compilada desde `qaqcbs.ui` (generada, no editar) |
+| `qaqc.spec`, `build_exe.bat` | Compilación con PyInstaller |
 | `tests/` | Pruebas con datos sintéticos (`python -m pytest tests`) |
 
 Para actualizar un estándar o un límite basta con editar `qaqc_config.py`.
@@ -101,6 +133,21 @@ Para actualizar un estándar o un límite basta con editar `qaqc_config.py`.
 - Gráficos agrupados en una ventana con pestañas, con barra de herramientas de matplotlib.
 - Carpeta de salida configurable y opción para no guardar los PNG (más rápido).
 - Ambos reportes de estándares (por analito y por estándar) en sub-pestañas.
+
+### Verificación con los archivos reales
+
+Con `BD_20241225.xlsx` y el Reporte QAQC 2024, los % de fallos de blancos, duplicados y
+estándares y los sesgos coinciden **exactamente** con la versión original (0 diferencias).
+La única diferencia es la lista de errores de Duplicado de Campo: la versión original
+mostraba 1 muestra (613354, que es de Pulpa) en lugar de las 15 muestras que realmente
+fallan en Cu.
+
+Los filtros de Malla y Reporte muestran sólo los valores con muestras en la BD de Leyes
+cargada (59 mallas y 146 reportes en vez de 785 y 1.150) y permiten buscar escribiendo.
+
+Los controles `STD-10`, `STD-11` y `STD-12` del reporte no tienen parámetros (media
+histórica, DE, BV) en el código, por lo que no se evalúan; el registro de actividad lo avisa
+si aparecen. Se agregan en `ESTANDARES` de `qaqc_config.py`.
 
 ### Nota
 

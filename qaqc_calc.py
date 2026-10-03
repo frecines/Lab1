@@ -14,7 +14,7 @@ import pandas as pd
 
 import qaqc_config as cfg
 
-COLS_REPORTE_QAQC = ["SAMPLE_ID", "CONTROLES", "MES ", "Malla", "Scheme"]
+COLS_REPORTE_QAQC = ["SAMPLE_ID", "CONTROLES", "MES", "Malla", "Scheme"]
 
 
 # --------------------------------------------------------------- utilidades
@@ -108,12 +108,32 @@ def _redondear(df, decimales=3):
 
 
 # ---------------------------------------------------------- lectura/union
+try:  # lector en Rust, ~4 veces mas rapido que openpyxl en archivos grandes
+    import python_calamine  # noqa: F401
+    MOTOR_EXCEL = "calamine"
+except ImportError:
+    MOTOR_EXCEL = None
+
+
+def _normalizar_columnas(df):
+    """Quita espacios sobrantes de los encabezados ('MES ' -> 'MES')."""
+    return df.rename(columns=lambda c: c.strip() if isinstance(c, str) else c)
+
+
+def _leer_excel(ruta, **opciones):
+    return pd.read_excel(ruta, engine=MOTOR_EXCEL, **opciones)
+
+
 def leer_bd_leyes(ruta):
-    return pd.read_excel(ruta, sheet_name="General")
+    return _normalizar_columnas(_leer_excel(ruta, sheet_name="General"))
 
 
 def leer_reporte_qaqc(ruta):
-    return pd.read_excel(ruta, sheet_name="LEYES SGS", header=1)
+    """Lee solo las columnas necesarias de la hoja 'LEYES SGS'."""
+    necesarias = set(COLS_REPORTE_QAQC) | {"FECHA DE ENVIO"}
+    bd = _leer_excel(ruta, sheet_name="LEYES SGS", header=1,
+                     usecols=lambda c: str(c).strip() in necesarias)
+    return _normalizar_columnas(bd)
 
 
 def opciones_filtro(bd_sec, columna):
@@ -129,6 +149,7 @@ def unir_bases(bd_ini, bd_sec, vmin, vmax, malla=None, reporte=None):
 
     Devuelve (bd_total, avisos).
     """
+    bd_ini, bd_sec = _normalizar_columnas(bd_ini), _normalizar_columnas(bd_sec)
     _requiere(bd_ini, ["SAMPLE_ID", "LAB_REPORT", *cfg.COLUMNA_BD.values()],
               "la BD de Leyes (hoja 'General')")
     _requiere(bd_sec, COLS_REPORTE_QAQC,
@@ -166,17 +187,25 @@ def _ids_control(bd_total, codigo):
     return np.sort(ids.to_numpy())
 
 
+# Codigos de CONTROLES que el modulo evalua ('Duplic' es la fila del
+# duplicado de campo, que se lee a traves de CAMPO ORIGIN).
+CONTROLES_CONOCIDOS = ({c["control"] for c in cfg.BLANCOS.values()}
+                       | {c["control"] for c in cfg.DUPLICADOS.values()}
+                       | {c["control"] for c in cfg.ESTANDARES.values()}
+                       | {"Duplic"})
+
+
 # --------------------------------------------------------------- blancos
 def procesar_blanco(bd_total, conf):
     ids = _ids_control(bd_total, conf["control"])
     cols = list(cfg.COLUMNA_BD.values())
-    propio = _buscar(bd_total, ids, cols + ["LAB_REPORT", "MES "])
+    propio = _buscar(bd_total, ids, cols + ["LAB_REPORT", "MES"])
     previo = _buscar(bd_total, ids - conf["desfase_prec"], cols)
 
     df = pd.DataFrame({"SAMPLE_ID": ids,
                        "SAMPLE_PREC": ids - conf["desfase_prec"],
                        "LAB_REPORT": propio["LAB_REPORT"],
-                       "MES": propio["MES "]})
+                       "MES": propio["MES"]})
     for e in cfg.ELEMENTOS:
         col = cfg.COLUMNA_BD[e]
         mav = conf["factor"] * conf["ld"][e]
@@ -229,9 +258,9 @@ def curva_hiperbolica(conf, elemento, xmax, n=200):
 def procesar_estandar(bd_total, conf):
     ids = _ids_control(bd_total, conf["control"])
     cols = [cfg.COLUMNA_BD[e] for e in cfg.ELEMENTOS_STD]
-    propio = _buscar(bd_total, ids, cols + ["LAB_REPORT", "MES "])
+    propio = _buscar(bd_total, ids, cols + ["LAB_REPORT", "MES"])
     df = pd.DataFrame({"SAMPLE_ID": ids, "LAB_REPORT": propio["LAB_REPORT"],
-                       "MES": propio["MES "]})
+                       "MES": propio["MES"]})
     for e in cfg.ELEMENTOS_STD:
         v = propio[cfg.COLUMNA_BD[e]]
         mh, de = conf["MH"][e], conf["DE"][e]
@@ -316,7 +345,8 @@ def reporte_estandares(estandares, por_analito=False):
         columnas = list(rep.columns)
         columnas[0], columnas[1] = columnas[1], columnas[0]
         rep = rep[columnas]
-    return _redondear(rep.drop(columns="_orden").reset_index(drop=True))
+    # 4 decimales: con 3, las leyes de Mo (0.0042) se veian como 0.004
+    return _redondear(rep.drop(columns="_orden").reset_index(drop=True), 4)
 
 
 def lista_errores(df, sufijo, elementos, columna_id="SAMPLE_ID"):
@@ -370,7 +400,7 @@ def exportar_excel(hojas, ruta):
 
 # ----------------------------------------------------- control externo
 def leer_reporte_externo(ruta):
-    bd = pd.read_excel(ruta, header=9)
+    bd = _leer_excel(ruta, header=9)
     for origen, destino in cfg.COMBINAR_EXT.items():
         if origen in bd.columns:
             bd[destino] = (bd[origen].combine_first(bd[destino])
