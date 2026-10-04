@@ -12,6 +12,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import qaqc_calc as calc  # noqa: E402
 import qaqc_config as cfg  # noqa: E402
+import qaqc_estandares as std  # noqa: E402
+
+ESTANDARES = std.PREDETERMINADOS
 
 # Cada bloque de 20 muestras: (posicion, CONTROLES)
 PATRON = {0: "CAMPO ORIGIN", 3: "RECHA", 6: "PULPA", 8: "BLK FINO",
@@ -40,7 +43,7 @@ def datos_sinteticos(n=400, inicio=1000, semilla=1):
         elif c in ("BLK FINO", "BLANCO"):
             leyes.loc[i, cfg.COLUMNA_BD.values()] = [0.0005, 0.15, 0.0007, 0.001, 0.0008, 0.05]
         elif c and c.startswith("STD"):
-            conf = next(v for v in cfg.ESTANDARES.values() if v["control"] == c)
+            conf = ESTANDARES[c]
             for e in cfg.ELEMENTOS_STD:
                 leyes.loc[i, cfg.COLUMNA_BD[e]] = rng.normal(conf["MH"][e], conf["DE"][e] * 1.5)
     leyes["CU"] = leyes["CU"].astype(object)
@@ -62,7 +65,7 @@ def resultados():
     leyes, sec = datos_sinteticos()
     total, avisos = calc.unir_bases(leyes, sec, 1000, 1399)
     assert avisos == []
-    return calc.ResultadosQAQC(total)
+    return calc.ResultadosQAQC(total, ESTANDARES)
 
 
 def test_a_numero():
@@ -194,8 +197,75 @@ def test_graficos(resultados):
                 ylabel="y", nombre_x="a", nombre_y="b")
         dibujar(plots.grafico_rd, df=df, col_prom="AG_PROM", col_rd="AG_RD", titulo="t",
                 etiqueta="Ag", id_col="SAMPLE_ORIG")
-    for clave, conf in cfg.ESTANDARES.items():
+    for clave, conf in resultados.conf_std.items():
         dibujar(plots.grafico_estandar, df=resultados.estandares[clave], elemento="AS",
                 conf=conf, meses=True)
     vacio = resultados.blancos["BF"].iloc[0:0]
     dibujar(plots.grafico_blanco, df=vacio, elemento="CU", titulo="t", tasa_error=np.nan)
+
+
+# ------------------------------------------------- parametros de estandares
+EXCEL_ESTANDARES = ("/root/.claude/uploads/06f4bf4c-f7a3-591b-9e7b-da240b7d8c1c/"
+                    "e98e23b9-Estandares_2026.xlsx")
+
+
+def test_solo_estandares_con_muestras(resultados):
+    # Los datos sinteticos tienen STD-13/14/15; STD-16/17/18 no se reportan
+    assert set(resultados.conf_std) == {"STD-13", "STD-14", "STD-15"}
+    assert "ErrorCHNB13" in resultados.reportes
+    tabla = calc.errores_estandares(resultados)
+    assert list(tabla.columns) == ["STD", "SAMPLE_ID", "LAB_REPORT", "OBS"]
+
+
+@pytest.mark.skipif(not os.path.exists(EXCEL_ESTANDARES), reason="Excel de ejemplo no disponible")
+def test_leer_excel_estandares():
+    leidos = std.leer_excel(EXCEL_ESTANDARES, std.PREDETERMINADOS)
+    assert list(leidos) == ["STD-16", "STD-17", "STD-18"]
+    for control, conf in leidos.items():
+        for campo in std.CAMPOS:
+            for e in cfg.ELEMENTOS_STD:
+                assert conf[campo][e] == pytest.approx(ESTANDARES[control][campo][e], rel=1e-12)
+        assert conf["codigo"] == ESTANDARES[control]["codigo"]  # se conserva
+
+
+def test_exportar_e_importar(tmp_path):
+    ruta = tmp_path / "est.xlsx"
+    std.exportar_excel(ESTANDARES, ruta)
+    leidos = std.leer_excel(ruta)
+    assert list(leidos) == list(ESTANDARES)
+    for control, conf in ESTANDARES.items():
+        assert leidos[control]["codigo"] == conf["codigo"]
+        assert leidos[control]["titulo"] == conf["titulo"]
+        for campo in std.CAMPOS:   # Excel guarda 15 cifras significativas
+            assert leidos[control][campo] == pytest.approx(conf[campo], rel=1e-13)
+
+
+def test_parametros_guardar_e_historial(tmp_path):
+    p = std.Parametros(str(tmp_path))
+    assert p.clave_correcta(std.CLAVE_INICIAL)
+    nuevos = std._copia(p.estandares)
+    nuevos["STD-16"]["MH"]["CU"] = 0.25
+    nuevos["STD-19"] = dict(codigo="X19", titulo="Prueba", BV={},
+                            MH={e: 1.0 for e in cfg.ELEMENTOS_STD},
+                            DE={e: 0.1 for e in cfg.ELEMENTOS_STD})
+    cambios = p.guardar(nuevos, std.hash_clave("nueva"))
+    assert ("STD-16", "Cu", "MH", repr(0.2454732824427479), repr(0.25)) in cambios
+    assert any(c[0] == "STD-19" and c[4] == "agregado" for c in cambios)
+    p2 = std.Parametros(str(tmp_path))          # se vuelve a leer del archivo
+    assert p2.estandares["STD-16"]["MH"]["CU"] == 0.25 and "STD-19" in p2.estandares
+    assert p2.clave_correcta("nueva") and not p2.clave_correcta(std.CLAVE_INICIAL)
+    historial = (tmp_path / std.HISTORIAL).read_text(encoding="utf-8-sig")
+    assert "STD-16;Cu;MH" in historial and "Contrasena" in historial
+
+
+def test_validacion_estandares():
+    malo = std._copia(ESTANDARES)
+    del malo["STD-18"]["DE"]["ZN"]
+    with pytest.raises(ValueError, match="STD-18 Zn: falta DE"):
+        std.validar(malo)
+
+
+def test_archivo_corrupto_usa_fabrica(tmp_path):
+    (tmp_path / std.ARCHIVO).write_text("{no es json", encoding="utf-8")
+    p = std.Parametros(str(tmp_path))
+    assert p.aviso and "STD-18" in p.estandares

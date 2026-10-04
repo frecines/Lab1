@@ -35,6 +35,7 @@ import pandas as pd  # noqa: E402
 
 import qaqc_calc as calc  # noqa: E402
 import qaqc_config as cfg  # noqa: E402
+import qaqc_estandares as estandares  # noqa: E402
 
 # matplotlib y los graficos se importan recien al abrir el primer grafico
 # (_modulos_graficos): asi la ventana principal abre ~0.8 s antes.
@@ -161,8 +162,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
         self.botones_qaqc = [self.GENR, self.GBF, self.PGBF, self.GBG, self.PGBG,
                              self.GDC, self.QQDC, self.RDDC, self.GRG, self.QQRG,
-                             self.RDRG, self.GDP, self.QQDP, self.RDDP, self.CHNB,
-                             self.CHNM, self.CHNA, self.CHNH, self.GRI]
+                             self.RDRG, self.GDP, self.QQDP, self.RDDP, self.GSTD,
+                             self.CHNH, self.GRI]
         self.botones_rma = [self.GRMA, self.QQPRMA, self.RDRMA, self.CUSSL, self.REPRMA]
         for boton in [self.BDQaqc, self.PROC, self.ProcRMA,
                       *self.botones_qaqc, *self.botones_rma]:
@@ -185,9 +186,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
             self.RDDC: lambda: self.graficos_rd_duplicado("DC"),
             self.RDRG: lambda: self.graficos_rd_duplicado("RG"),
             self.RDDP: lambda: self.graficos_rd_duplicado("DP"),
-            self.CHNB: lambda: self.graficos_estandar("B"),
-            self.CHNM: lambda: self.graficos_estandar("M"),
-            self.CHNA: lambda: self.graficos_estandar("A"),
+            self.GSTD: lambda: self.graficos_estandar(self.cmbSTD.currentData()),
+            self.ParamSTD: self.parametros_estandares,
             self.CHNH: self.graficos_historico,
             self.ImpRMA: self.importar_externo, self.ProcRMA: self.procesar_externo,
             self.GRMA: self.graficos_rma, self.QQPRMA: self.graficos_qq_rma,
@@ -198,6 +198,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
             # lambda: descarta el argumento 'checked' que envia clicked
             boton.clicked.connect(lambda _=False, s=slot: s())
         self.actionAcerca.triggered.connect(self.acerca_de)
+        self.actionEstandares.triggered.connect(lambda _=False: self.parametros_estandares())
+        self.param = estandares.Parametros()
 
         # Malla (~800 valores) y Scheme (~1100): combos con busqueda por texto
         for combo in (self.VMalla, self.VLote):
@@ -213,6 +215,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.progreso.hide()
         self.statusbar.addPermanentWidget(self.progreso)
         self._mostrar_carpeta()
+        if self.param.aviso:
+            self.log(self.param.aviso, error=True)
+        self.log(f"Estandares cargados ({', '.join(self.param.estandares)}) - "
+                 f"actualizados: {self.param.actualizado}.")
         self.log("Seleccione la BD de Leyes para comenzar.")
 
     # ------------------------------------------------------------ utilidades
@@ -266,6 +272,14 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.log(mensaje)
         QThreadPool.globalInstance().start(tarea)
 
+    def parametros_estandares(self):
+        from qaqc_dialogo_estandares import DialogoEstandares
+        if DialogoEstandares(self.param, self).exec_():
+            self.log(f"Parametros de estandares guardados ({self.param.actualizado}).")
+            if self.res is not None:
+                self.log("Recalculando con los nuevos parametros...")
+                self.procesar()
+
     def acerca_de(self):
         QMessageBox.about(self, "Acerca de", "Modulo QAQC\n\n"
                           "Desarrollado por: Felix Recines Trinidad")
@@ -308,7 +322,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
     # ---------------------------------------------------------------- tablas
     @staticmethod
-    def llenar_tabla(tabla, df, col_estandar=None, gris_primera=True):
+    def llenar_tabla(tabla, df, col_estandar=None, gris_primera=True, colores=None):
         tabla.clear()
         tabla.setRowCount(df.shape[0])
         tabla.setColumnCount(df.shape[1])
@@ -322,7 +336,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 if j in clases and texto in COLOR_CLASE:
                     item.setForeground(QColor(COLOR_CLASE[texto]))
                 if j == col_estandar:
-                    item.setBackground(QColor(cfg.COLOR_ESTANDAR.get(texto, "lightgray")))
+                    item.setBackground(QColor((colores or {}).get(texto, "lightgray")))
                 elif j == 0 and gris_primera:
                     item.setBackground(GRIS)
                 tabla.setItem(i, j, item)
@@ -334,12 +348,19 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.llenar_tabla(self.DFBLF, r["Blanco Fino"])
         self.llenar_tabla(self.DFBLG, r["Blanco Grueso"])
         self.llenar_tabla(self.DFDUP, r["Duplicado"])
-        self.llenar_tabla(self.DFSTD, r["Estandares"], col_estandar=0)
-        self.llenar_tabla(self.DFSTDB, r["Estandares por Analito"], col_estandar=1)
+        colores = estandares.colores(self.param.estandares)
+        self.llenar_tabla(self.DFSTD, r["Estandares"], col_estandar=0, colores=colores)
+        self.llenar_tabla(self.DFSTDB, r["Estandares por Analito"], col_estandar=1,
+                          colores=colores)
+        self.llenar_tabla(self.E_STD, calc.errores_estandares(self.res), col_estandar=0,
+                          colores=colores)
+        self.cmbSTD.clear()
+        for control, conf in self.res.conf_std.items():
+            self.cmbSTD.addItem(f"{conf['codigo']} - {conf['titulo']} ({control})", control)
+        self.GSTD.setEnabled(bool(self.res.conf_std))
         errores = {self.ErrorBlancoF: "ErrorBlancoFino", self.ErrorBlancoG: "ErrorBlancoGrueso",
                    self.E_DUPC: "ErrorDuplicadoCampo", self.E_RG: "ErrorRechazoGrueso",
-                   self.E_PULP: "ErrorDuplicadoPulpa", self.E_STDB: "ErrorCHNB",
-                   self.E_STDM: "ErrorCHNM", self.E_STDA: "ErrorCHNA"}
+                   self.E_PULP: "ErrorDuplicadoPulpa"}
         for tabla, hoja in errores.items():
             self.llenar_tabla(tabla, r[hoja], gris_primera=False)
 
@@ -410,10 +431,11 @@ class MyApp(QMainWindow, Ui_MainWindow):
         malla = self._filtro(self.VMalla, "La malla")
         reporte = self._filtro(self.VLote, "El reporte")
         bd_ini, bd_sec = self.bd_ini, self.bd_sec
+        parametros_std = dict(self.param.estandares)
 
         def calcular():
             bd_total, avisos = calc.unir_bases(bd_ini, bd_sec, vmin, vmax, malla, reporte)
-            return calc.ResultadosQAQC(bd_total), avisos
+            return calc.ResultadosQAQC(bd_total, parametros_std), avisos
 
         filtros = [f"rango {vmin} - {vmax}"]
         filtros += [f"malla {malla}"] if malla else []
@@ -439,7 +461,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
         resumen = ", ".join(f"{k}: {v}" for k, v in conteo.items())
         self.log(f"Procesado ({filtros}): {len(res.bd_total)} muestras. "
                  f"Controles -> {resumen or 'ninguno'}.")
-        sin_parametros = [c for c in conteo.index if c not in calc.CONTROLES_CONOCIDOS]
+        sin_parametros = [c for c in conteo.index
+                          if c not in calc.controles_conocidos(self.param.estandares)]
         if sin_parametros:
             self.log(f"Controles sin parametros en qaqc_config.py (no se evaluan): "
                      f"{', '.join(map(str, sin_parametros))}")
@@ -479,7 +502,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 for e in cfg.ELEMENTOS]
 
     def _lista_estandar(self, clave, meses=False, prefijo=""):
-        conf, df = cfg.ESTANDARES[clave], self.res.estandares[clave]
+        conf, df = self.res.conf_std[clave], self.res.estandares[clave]
         sufijo = " Hist" if meses else ""
         return [(f"{prefijo}{cfg.ETIQUETA[e]}", f"{conf['titulo']} {cfg.ETIQUETA[e]}{sufijo}",
                  (10, 6), functools.partial(plots.grafico_estandar, df=df, elemento=e,
@@ -536,14 +559,16 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
     @accion("Error al graficar")
     def graficos_estandar(self, clave):
-        self._mostrar(cfg.ESTANDARES[clave]["titulo"], self._lista_estandar(clave))
+        if not clave:
+            raise ValueError("No hay estandares con muestras en el rango procesado.")
+        self._mostrar(self.res.conf_std[clave]["titulo"], self._lista_estandar(clave))
 
     @accion("Error al graficar")
     def graficos_historico(self):
         graficos = []
         for clave in cfg.BLANCOS:
             graficos += self._lista_blanco(clave, meses=True, prefijo=f"{clave} ")
-        for clave, conf in cfg.ESTANDARES.items():
+        for clave, conf in self.res.conf_std.items():
             graficos += self._lista_estandar(clave, meses=True, prefijo=f"{conf['codigo']} ")
         self._mostrar("Historico por Mes - Blancos y Estandares", graficos)
 

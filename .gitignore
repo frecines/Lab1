@@ -161,3 +161,8 @@ cython_debug/
 
 # Spec de PyInstaller del proyecto
 !qaqc.spec
+
+# Datos del usuario generados por la aplicacion
+estandares.json
+historial_estandares.csv
+Resultados_QAQC/

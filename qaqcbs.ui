@@ -492,23 +492,26 @@
         <item row="0" column="0" colspan="3">
          <layout class="QHBoxLayout" name="layoutBotonesSTD">
           <item>
-           <widget class="QPushButton" name="CHNB">
+           <widget class="QLabel" name="lblSTD">
             <property name="text">
-             <string>STD CHNB (Baja Ley)</string>
+             <string>Estándar:</string>
             </property>
            </widget>
           </item>
           <item>
-           <widget class="QPushButton" name="CHNM">
-            <property name="text">
-             <string>STD CHNM (Media Ley)</string>
+           <widget class="QComboBox" name="cmbSTD">
+            <property name="minimumSize">
+             <size>
+              <width>320</width>
+              <height>0</height>
+             </size>
             </property>
            </widget>
           </item>
           <item>
-           <widget class="QPushButton" name="CHNA">
+           <widget class="QPushButton" name="GSTD">
             <property name="text">
-             <string>STD CHNA (Alta Ley)</string>
+             <string>Gráfico del Estándar</string>
             </property>
            </widget>
           </item>
@@ -516,6 +519,20 @@
            <widget class="QPushButton" name="CHNH">
             <property name="text">
              <string>Histórico por Mes (Blancos y STD)</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="spacerSTD">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QPushButton" name="ParamSTD">
+            <property name="text">
+             <string>Parámetros de Estándares...</string>
             </property>
            </widget>
           </item>
@@ -545,35 +562,15 @@
           </widget>
          </widget>
         </item>
-        <item row="2" column="0">
+        <item row="2" column="0" colspan="3">
          <widget class="QLabel" name="label_16">
           <property name="text">
-           <string>&lt;b&gt;Muestras con error - STD CHNB&lt;/b&gt;</string>
+           <string>&lt;b&gt;Muestras con error - Estándares (fuera de MH ± 3DE)&lt;/b&gt;</string>
           </property>
          </widget>
         </item>
-        <item row="2" column="1">
-         <widget class="QLabel" name="label_20">
-          <property name="text">
-           <string>&lt;b&gt;Muestras con error - STD CHNM&lt;/b&gt;</string>
-          </property>
-         </widget>
-        </item>
-        <item row="2" column="2">
-         <widget class="QLabel" name="label_21">
-          <property name="text">
-           <string>&lt;b&gt;Muestras con error - STD CHNA&lt;/b&gt;</string>
-          </property>
-         </widget>
-        </item>
-        <item row="3" column="0">
-         <widget class="QTableWidget" name="E_STDB"/>
-        </item>
-        <item row="3" column="1">
-         <widget class="QTableWidget" name="E_STDM"/>
-        </item>
-        <item row="3" column="2">
-         <widget class="QTableWidget" name="E_STDA"/>
+        <item row="3" column="0" colspan="3">
+         <widget class="QTableWidget" name="E_STD"/>
         </item>
        </layout>
       </widget>
@@ -750,15 +747,27 @@
    </layout>
   </widget>
   <widget class="QMenuBar" name="menubar">
+   <widget class="QMenu" name="menuHerramientas">
+    <property name="title">
+     <string>Herramientas</string>
+    </property>
+    <addaction name="actionEstandares"/>
+   </widget>
    <widget class="QMenu" name="menuAyuda">
     <property name="title">
      <string>Ayuda</string>
     </property>
     <addaction name="actionAcerca"/>
    </widget>
+   <addaction name="menuHerramientas"/>
    <addaction name="menuAyuda"/>
   </widget>
   <widget class="QStatusBar" name="statusbar"/>
+  <action name="actionEstandares">
+   <property name="text">
+    <string>Parámetros de estándares...</string>
+   </property>
+  </action>
   <action name="actionAcerca">
    <property name="text">
     <string>Acerca de...</string>

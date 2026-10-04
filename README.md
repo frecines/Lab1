@@ -21,6 +21,35 @@ python qaqc.py
 3. Los PNG (300 dpi) y los Excel se guardan en la **carpeta de salida**
    (por defecto `Resultados_QAQC`, junto a la BD de Leyes). Guardar los PNG es opcional.
 
+## Parámetros de estándares (sin modificar el código)
+
+Los valores de cada estándar (BV, MH y DE por elemento) ya no están en el código: se
+guardan en **`estandares.json`**, junto al `.exe` (si esa carpeta no permite escribir,
+en `%APPDATA%\ModuloQAQC`). Se administran desde **Herramientas → Parámetros de
+estándares** (o el botón en la pestaña *Estándares*):
+
+1. La ventana abre en **solo lectura**. *Desbloquear edición* pide la contraseña
+   (inicial: `qaqc`; **cambiarla en el primer uso** con *Cambiar contraseña*).
+2. **Importar desde Excel**: acepta el mismo formato de `Estandares_2026.xlsx`
+   (Estándar | Elemento | Valor Esperado BV: Media | Valor Histórico: Media, Std. Dev.).
+   Muestra qué valores cambian antes de aplicarlos. Columnas opcionales: `Código` y
+   `Descripción`.
+3. También se puede editar a mano, **agregar** un estándar nuevo (p. ej. `STD-19`, tal
+   como aparece en la columna CONTROLES) o **eliminar** uno.
+4. **Guardar** pide confirmación, valida que MH y DE estén completos (BV vacío =
+   "No Certificado") y registra cada cambio en **`historial_estandares.csv`**
+   (fecha, usuario de Windows, estándar, elemento, campo, valor anterior y nuevo).
+   Si ya había datos procesados, se recalculan automáticamente.
+5. *Exportar a Excel* guarda los valores vigentes en el mismo formato (respaldo).
+
+La pestaña *Estándares* muestra solo los estándares que tienen muestras en el rango
+procesado; los controles `STD-xx` sin parámetros se avisan en el registro de actividad.
+
+> La contraseña evita cambios accidentales, pero no es una protección fuerte: quien
+> tenga acceso a la carpeta puede editar `estandares.json`. Para control real, dejar
+> la carpeta del programa en una ubicación de red con permisos de escritura solo para
+> el responsable de QAQC; los demás usuarios podrán usar la aplicación pero no guardar.
+
 ## Ejecutable (PyInstaller)
 
 En Windows, doble clic en **`build_exe.bat`** (instala dependencias, recompila la
@@ -59,12 +88,15 @@ debe compilarse en Windows.
 | `qaqcbs.ui` | Diseño de la ventana (Qt Designer) |
 | `qaqc_calc.py` | Lectura, unión, cálculos y reportes (sin Qt, se puede usar desde scripts) |
 | `qaqc_plots.py` | Una función por tipo de gráfico |
-| `qaqc_config.py` | **Parámetros**: límites de detección, medias históricas, valores certificados, desviaciones, pendientes, umbrales de clasificación y fecha límite |
+| `qaqc_config.py` | Parámetros fijos: límites de detección, pendientes, umbrales de clasificación y fecha límite |
+| `qaqc_estandares.py` | Parámetros de estándares (`estandares.json`), importación/exportación Excel e historial |
+| `qaqc_dialogo_estandares.py` | Ventana *Parámetros de estándares* |
 | `ui_qaqcbs.py` | Interfaz compilada desde `qaqcbs.ui` (generada, no editar) |
 | `qaqc.spec`, `build_exe.bat` | Compilación con PyInstaller |
 | `tests/` | Pruebas con datos sintéticos (`python -m pytest tests`) |
 
-Para actualizar un estándar o un límite basta con editar `qaqc_config.py`.
+Los estándares se actualizan desde la aplicación (ver arriba); los límites de detección y
+umbrales, en `qaqc_config.py`.
 
 ## Cambios respecto a la versión anterior
 
@@ -117,7 +149,7 @@ Para actualizar un estándar o un límite basta con editar `qaqc_config.py`.
   estaba copiado 6 veces (una por elemento) y cada grupo de gráficos 3 veces
   (DC/RG/DP, CHNB/CHNM/CHNA). Ahora hay una función por tipo de gráfico.
 - Las constantes (medias, BV, DE, límites) estaban duplicadas en `NewCol` y `REPORT`;
-  ahora están una sola vez en `qaqc_config.py`.
+  ahora están una sola vez (`qaqc_config.py` y `estandares.json`).
 - Se eliminó la dependencia de `statsmodels`.
 
 ### Interfaz
@@ -145,9 +177,9 @@ fallan en Cu.
 Los filtros de Malla y Reporte muestran sólo los valores con muestras en la BD de Leyes
 cargada (59 mallas y 146 reportes en vez de 785 y 1.150) y permiten buscar escribiendo.
 
-Los controles `STD-10`, `STD-11` y `STD-12` del reporte no tienen parámetros (media
-histórica, DE, BV) en el código, por lo que no se evalúan; el registro de actividad lo avisa
-si aparecen. Se agregan en `ESTANDARES` de `qaqc_config.py`.
+Los controles `STD-10`, `STD-11` y `STD-12` del reporte 2024 no tienen parámetros cargados,
+por lo que no se evalúan (el registro de actividad lo avisa); se pueden agregar desde
+*Parámetros de estándares*.
 
 ### Nota
 

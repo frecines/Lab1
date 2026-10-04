@@ -32,7 +32,8 @@ a = Analysis(
     datas=[("qaqcbs.ui", ".")],
     # pandas carga los motores de Excel de forma dinamica
     hiddenimports=["python_calamine", "openpyxl", "xlsxwriter",
-                   "matplotlib.backends.backend_qt5agg", "qaqc_plots"],
+                   "matplotlib.backends.backend_qt5agg", "qaqc_plots",
+                   "qaqc_dialogo_estandares"],
     excludes=EXCLUIR,
     noarchive=False,
 )

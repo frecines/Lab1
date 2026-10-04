@@ -187,12 +187,12 @@ def _ids_control(bd_total, codigo):
     return np.sort(ids.to_numpy())
 
 
-# Codigos de CONTROLES que el modulo evalua ('Duplic' es la fila del
-# duplicado de campo, que se lee a traves de CAMPO ORIGIN).
-CONTROLES_CONOCIDOS = ({c["control"] for c in cfg.BLANCOS.values()}
-                       | {c["control"] for c in cfg.DUPLICADOS.values()}
-                       | {c["control"] for c in cfg.ESTANDARES.values()}
-                       | {"Duplic"})
+def controles_conocidos(estandares):
+    """Codigos de CONTROLES que el modulo evalua ('Duplic' es la fila del
+    duplicado de campo, que se lee a traves de CAMPO ORIGIN)."""
+    return ({c["control"] for c in cfg.BLANCOS.values()}
+            | {c["control"] for c in cfg.DUPLICADOS.values()}
+            | set(estandares) | {"Duplic"})
 
 
 # --------------------------------------------------------------- blancos
@@ -278,15 +278,20 @@ def sesgo_estandar(df, conf, elemento):
 
 # ------------------------------------------------------------- resultados
 class ResultadosQAQC:
-    """Agrupa todo lo calculado a partir de la BD unida."""
+    """Agrupa todo lo calculado a partir de la BD unida.
 
-    def __init__(self, bd_total):
+    `estandares`: {control: parametros} (ver qaqc_estandares). Solo se evaluan
+    los estandares que tienen muestras en el rango procesado.
+    """
+
+    def __init__(self, bd_total, estandares):
         self.bd_total = bd_total
         self.blancos = {k: procesar_blanco(bd_total, c) for k, c in cfg.BLANCOS.items()}
         self.duplicados = {k: procesar_duplicado(bd_total, c)
                            for k, c in cfg.DUPLICADOS.items()}
-        self.estandares = {k: procesar_estandar(bd_total, c)
-                           for k, c in cfg.ESTANDARES.items()}
+        presentes = set(bd_total["CONTROLES"].dropna())
+        self.conf_std = {k: dict(c, control=k) for k, c in estandares.items() if k in presentes}
+        self.estandares = {k: procesar_estandar(bd_total, c) for k, c in self.conf_std.items()}
         self.reportes = generar_reportes(self)
 
     def conteo_controles(self):
@@ -317,9 +322,17 @@ def reporte_duplicados(duplicados):
     return _redondear(rep)
 
 
-def reporte_estandares(estandares, por_analito=False):
+COLUMNAS_REPORTE_STD = ["Nombre\nSTD", "Analito", "N° Muestras", "Media\nActual\n(MA)",
+                        "Media\nHistorica\n(MH)", "Media\nCertificada\n(BV)",
+                        "Lim. de\nControl\nMH-2STD", "Lim. de\nControl\nMH+2STD",
+                        "Sesgo(%)", "Clase", "# Fallidos", "% Fallidos"]
+
+
+def reporte_estandares(estandares, conf_std, por_analito=False):
     filas = []
-    for clave, conf in cfg.ESTANDARES.items():
+    if not conf_std:
+        return pd.DataFrame(columns=COLUMNAS_REPORTE_STD)
+    for clave, conf in conf_std.items():
         df = estandares[clave]
         for e in cfg.ELEMENTOS_STD:
             mh, de, bv = conf["MH"][e], conf["DE"][e], conf["BV"].get(e)
@@ -366,8 +379,9 @@ def lista_errores(df, sufijo, elementos, columna_id="SAMPLE_ID"):
 def generar_reportes(res):
     rep = {
         "Duplicado": reporte_duplicados(res.duplicados),
-        "Estandares": reporte_estandares(res.estandares),
-        "Estandares por Analito": reporte_estandares(res.estandares, por_analito=True),
+        "Estandares": reporte_estandares(res.estandares, res.conf_std),
+        "Estandares por Analito": reporte_estandares(res.estandares, res.conf_std,
+                                                     por_analito=True),
         "Blanco Fino": reporte_blanco(res.blancos["BF"]),
         "Blanco Grueso": reporte_blanco(res.blancos["BG"]),
     }
@@ -380,16 +394,26 @@ def generar_reportes(res):
                                              cfg.ELEMENTOS, "SAMPLE_ORIG"),
         "ErrorBlancoGrueso": lista_errores(res.blancos["BG"], "ERR", cfg.ELEMENTOS),
         "ErrorBlancoFino": lista_errores(res.blancos["BF"], "ERR", cfg.ELEMENTOS),
-        "ErrorCHNB": lista_errores(res.estandares["B"], "OUT", cfg.ELEMENTOS_STD),
-        "ErrorCHNM": lista_errores(res.estandares["M"], "OUT", cfg.ELEMENTOS_STD),
-        "ErrorCHNA": lista_errores(res.estandares["A"], "OUT", cfg.ELEMENTOS_STD),
     }
+    for clave, conf in res.conf_std.items():
+        errores[f"Error{conf['codigo']}"] = lista_errores(res.estandares[clave], "OUT",
+                                                          cfg.ELEMENTOS_STD)
     total = [e.rename(columns={"SAMPLE_ORIG": "SAMPLE_ID"})
              .assign(**{"Ubicacion Error": nombre})
              for nombre, e in errores.items()]
     rep.update(errores)
     rep["TotalError"] = pd.concat(total, ignore_index=True)
     return rep
+
+
+def errores_estandares(res):
+    """Errores de todos los estandares en una sola tabla con columna STD."""
+    partes = [res.reportes[f"Error{c['codigo']}"].assign(STD=c["codigo"])
+              for c in res.conf_std.values()]
+    if not partes:
+        return pd.DataFrame(columns=["STD", "SAMPLE_ID", "LAB_REPORT", "OBS"])
+    tabla = pd.concat(partes, ignore_index=True)
+    return tabla[["STD", "SAMPLE_ID", "LAB_REPORT", "OBS"]]
 
 
 def exportar_excel(hojas, ruta):
@@ -501,7 +525,8 @@ def ratio_insercion(bd_total, n_externo, anio, mes):
     def n(codigo):
         return int(conteo.get(codigo, 0))
 
-    n_std = sum(n(c["control"]) for c in cfg.ESTANDARES.values())
+    # Todos los estandares insertados, tengan o no parametros cargados
+    n_std = int(conteo[conteo.index.astype(str).str.upper().str.startswith("STD")].sum())
     tipos = [("Dup de Campo", n(cfg.CTRL_DUP_CAMPO)),
              ("Rechazo Grueso", n(cfg.CTRL_RECHAZO)),
              ("Dup de Pulpa", n(cfg.CTRL_PULPA)),

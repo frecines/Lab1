@@ -78,44 +78,8 @@ VENTANA_MEDIA_MOVIL_RD = 5
 
 # ------------------------------------------------------------- Estandares
 ELEMENTOS_STD = ["CU", "AG", "MO", "AS", "ZN"]
-# MH: media historica, BV: valor certificado (best value), DE: desviacion
-ESTANDARES = {
-    "B": dict(
-        control="STD-13", codigo="CHNB13", titulo="Estandar Baja Ley CHNB-13",
-        MH={"CU": 0.266184914841849, "AG": 2.6863779342723,
-            "MO": 0.00419716312056736, "AS": 0.0072113022113022,
-            "ZN": 0.0253397590361446},
-        BV={"CU": 0.266031884057971, "MO": 0.00423220338983051,
-            "ZN": 0.0263231884057971},
-        DE={"CU": 0.0036884613991108, "AG": 0.184056641873746,
-            "MO": 0.000121177044741277, "AS": 0.000701560557845971,
-            "ZN": 0.000902350628509791},
-    ),
-    "M": dict(
-        control="STD-14", codigo="CHNM14", titulo="Estandar Media Ley CHNM-14",
-        MH={"CU": 0.427990543735225, "AG": 4.6302027972028,
-            "MO": 0.00978690476190473, "AS": 0.016616091954023,
-            "ZN": 0.0456080760095013},
-        BV={"CU": 0.420332352941176, "MO": 0.00996842105263158,
-            "AS": 0.0162754385964912, "ZN": 0.0453863636363636},
-        DE={"CU": 0.00745666186049466, "AG": 0.177246972191448,
-            "MO": 0.000271115331782672, "AS": 0.000827086603439742,
-            "ZN": 0.00114052258444863},
-    ),
-    "A": dict(
-        control="STD-15", codigo="CHNA15", titulo="Estandar Alta Ley CHNA-15",
-        MH={"CU": 0.662866666666667, "AG": 10.3921145584725,
-            "MO": 0.0104511961722488, "AS": 0.0685093896713616,
-            "ZN": 0.155243309002433},
-        BV={"CU": 0.676945762711864, "AG": 10.140350877193,
-            "MO": 0.0105706896551724, "AS": 0.07035,
-            "ZN": 0.149810294117647},
-        DE={"CU": 0.0119090159918189, "AG": 0.181529114416518,
-            "MO": 0.000309809262563219, "AS": 0.00221782216510573,
-            "ZN": 0.00304505560834989},
-    ),
-}
-COLOR_ESTANDAR = {"CHNB13": "yellow", "CHNM14": "orange", "CHNA15": "green"}
+# Los parametros de cada estandar (MH, BV, DE) ya no estan aqui: se editan
+# desde la aplicacion y se guardan en estandares.json (ver qaqc_estandares.py).
 
 # Clasificacion del sesgo (%): |sesgo| <= 5 aceptable, <= 10 cuestionable
 SESGO_ACEPTABLE = 5
