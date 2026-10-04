@@ -22,8 +22,9 @@ import qaqc_estandares as std
 
 COL_STD = ["Control (en CONTROLES)", "Código", "Descripción (título de gráficos)"]
 COL_VAL = ["Elemento", "BV - Valor esperado\n(vacío = no certificado)",
-           "MH - Media histórica", "DE - Desviación estándar"]
-CAMPOS_VAL = ("BV", "MH", "DE")
+           "CV del BV (%)\n(> 5% no se grafica)", "MH - Media histórica",
+           "DE - Desviación estándar"]
+CAMPOS_VAL = ("BV", "CV", "MH", "DE")
 
 
 class DialogoEstandares(QtWidgets.QDialog):
@@ -153,7 +154,7 @@ class DialogoEstandares(QtWidgets.QDialog):
             nombre.setBackground(QColor("lightgray"))
             self.tblVal.setItem(i, 0, nombre)
             for j, campo in enumerate(CAMPOS_VAL, start=1):
-                valor = conf[campo].get(e) if conf else None
+                valor = conf.get(campo, {}).get(e) if conf else None
                 self.tblVal.setItem(i, j, QtWidgets.QTableWidgetItem(
                     "" if valor is None else repr(valor)))
         self._cargando = False
@@ -174,10 +175,10 @@ class DialogoEstandares(QtWidgets.QDialog):
         campo = CAMPOS_VAL[item.column() - 1]
         texto = item.text().strip().replace(",", ".")
         if not texto:
-            self.trabajo[control][campo].pop(elemento, None)
+            self.trabajo[control].setdefault(campo, {}).pop(elemento, None)
             return
         try:
-            self.trabajo[control][campo][elemento] = float(texto)
+            self.trabajo[control].setdefault(campo, {})[elemento] = float(texto)
         except ValueError:
             QMessageBox.warning(self, "Valor inválido", f"'{item.text()}' no es un número.")
             self._mostrar_valores()
@@ -228,10 +229,10 @@ class DialogoEstandares(QtWidgets.QDialog):
             QMessageBox.warning(self, "Ya existe", f"{control} ya está en la lista.")
             return
         self.trabajo[control] = dict(codigo=control, titulo=f"Estandar {control}",
-                                     BV={}, MH={}, DE={})
+                                     BV={}, CV={}, MH={}, DE={})
         self._llenar_estandares(control)
         QMessageBox.information(self, "Agregar estándar",
-                                "Complete MH y DE de los 5 elementos (BV es opcional) "
+                                "Complete MH y DE de los 5 elementos (BV y CV son opcionales) "
                                 "y luego presione Guardar.")
 
     def eliminar(self):

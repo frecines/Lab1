@@ -56,6 +56,10 @@ BLANCOS = {
 # % de fallos a partir del cual el blanco es INACEPTABLE
 UMBRAL_FALLOS_BLANCO = 5
 
+# Limites de deteccion declarados por el laboratorio (Tabla 6 del informe)
+LD_LABORATORIO = {"CU": 0.001, "AG": 0.3, "MO": 0.0005, "AS": 0.001,
+                  "ZN": 0.001, "FE": 0.001}
+
 # ------------------------------------------------------------- Duplicados
 # Limite de deteccion practico usado en la funcion hiperbolica
 LD_DUPLICADO = {"CU": 0.001, "AG": 0.3, "MO": 0.0015, "AS": 0.002,
@@ -80,6 +84,10 @@ VENTANA_MEDIA_MOVIL_RD = 5
 ELEMENTOS_STD = ["CU", "AG", "MO", "AS", "ZN"]
 # Los parametros de cada estandar (MH, BV, DE) ya no estan aqui: se editan
 # desde la aplicacion y se guardan en estandares.json (ver qaqc_estandares.py).
+
+# Elementos de un estandar cuyo valor esperado (BV) tiene CV mayor a este %
+# no se grafican (Wood, 2021: solo elementos certificados con CV < 5%).
+UMBRAL_CV_ESTANDAR = 5
 
 # Clasificacion del sesgo (%): |sesgo| <= 5 aceptable, <= 10 cuestionable
 SESGO_ACEPTABLE = 5

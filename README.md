@@ -50,17 +50,71 @@ procesado; los controles `STD-xx` sin parámetros se avisan en el registro de ac
 > la carpeta del programa en una ubicación de red con permisos de escritura solo para
 > el responsable de QAQC; los demás usuarios podrán usar la aplicación pero no guardar.
 
+## Informe mensual en Word
+
+Después de **Procesar Datos** (y, si corresponde, procesar el control externo en la
+pestaña RMA), el botón **Generar Informe Word...** crea
+`Informe_de_Control_de_Calidad_<Mes><Año>.docx` en la carpeta de salida, con la misma
+estructura del informe de enero 2025:
+
+- Memo (A, De, Fecha, Asunto, Anexos). "A" y "De" se recuerdan para el mes siguiente.
+- Tabla 1 (lotes / ratio de inserción), Tabla 2 (duplicados), Tablas 3-4 (blancos),
+  Tabla 5 (estándares), Tabla 6 (control externo), límites prácticos de detección y
+  MRCs utilizados (con su CV): tablas de Word reales, con los mismos colores de la app.
+- Los textos con números se llenan solos: cantidades, tasas de inserción, rango de
+  tasas de error ("entre 0% para Mo y 12.74% para Zn"), elementos inaceptables,
+  clasificación de sesgos y RMA, y un borrador de conclusiones.
+- **Lo que requiere interpretación queda resaltado en amarillo** `[Interpretación]`
+  para completarlo en Word (y luego quitar el resaltado).
+- Análisis del acumulado (gráficos históricos por mes de los estándares) y
+  **Anexo A** con todos los gráficos (opcionales). Unos 70-90 gráficos tardan ~15 s.
+
+## Estándares con CV > 5%
+
+Cada estándar tiene, por elemento, el **CV (%) del valor esperado BV** (columna nueva en
+*Parámetros de estándares*; se importa del Excel de estándares, columna "CV (%)").
+Los elementos con **CV > 5%** (Wood, 2021) **no se grafican**: ni en la ventana del
+estándar, ni en el histórico, ni en el Anexo del informe. El registro de actividad indica
+cuáles se omitieron. Con los valores de `Estandares_2026.xlsx` se omite **Ag** en
+STD-16, STD-17 y STD-18. El umbral está en `UMBRAL_CV_ESTANDAR` (`qaqc_config.py`).
+Los estándares STD-13/14/15 no tienen CV cargado, por lo que se grafican todos sus
+elementos hasta que se ingrese su CV.
+
+## Prueba en Spyder (antes de compilar)
+
+1. **Instalar dependencias** (una sola vez). Abrir *Anaconda Prompt*, activar el entorno
+   que usa Spyder y, en la carpeta de los archivos:
+   ```
+   cd C:\ruta\a\ModuloQAQC
+   pip install -r requirements.txt
+   ```
+2. Abrir `qaqc.py` en Spyder. Todos los `.py`, `qaqcbs.ui` y `ui_qaqcbs.py` deben estar
+   en la misma carpeta.
+3. **Ejecutar > Configuración por archivo** (Ctrl+F6) → marcar
+   **"Ejecutar en una terminal del sistema externa"** → Aceptar. Las aplicaciones PyQt
+   ejecutadas dentro de la consola IPython de Spyder suelen colgarse o cerrar el kernel
+   en la segunda ejecución; en una terminal externa se comportan como el `.exe`.
+   (Alternativa: ejecutar en la consola y usar *Consolas > Reiniciar kernel* antes de cada
+   ejecución.)
+4. **F5** para ejecutar. Probar: BD Leyes → Reporte QAQC → Procesar Datos → gráficos de
+   cada pestaña → *Parámetros de estándares* → *Generar Informe Word*.
+5. Opcional, pruebas automáticas (en Anaconda Prompt): `pip install pytest` y
+   `python -m pytest tests`.
+
+Al ejecutar desde Spyder, `estandares.json` y `historial_estandares.csv` se crean en la
+carpeta del código; el `.exe` usa los de su propia carpeta (se pueden copiar).
+
 ## Ejecutable (PyInstaller)
 
-En Windows, doble clic en **`build_exe.bat`** (instala dependencias, recompila la
-interfaz y ejecuta `pyinstaller qaqc.spec`). Resultado: `dist\ModuloQAQC\ModuloQAQC.exe`;
-se distribuye **la carpeta `dist\ModuloQAQC` completa**.
+Desde *Anaconda Prompt* (con el mismo entorno de Spyder), en la carpeta de los archivos,
+ejecutar **`build_exe.bat`**: instala dependencias, recompila la interfaz y ejecuta
+`pyinstaller qaqc.spec`. Resultado: **`dist\Modulo QAQC.exe`** con el icono `Grid.ico`.
 
-- Por defecto se compila en modo carpeta, que abre más rápido. El modo de un solo archivo
-  (`UN_SOLO_ARCHIVO = True` en `qaqc.spec`) es más cómodo de copiar, pero en cada
-  inicio descomprime todo el paquete (más de 100 MB) en una carpeta temporal y tarda
-  bastante más en abrir.
-- Para un icono propio, colocar `qaqc.ico` junto a `qaqc.spec`.
+- `qaqc.spec` reemplaza al spec anterior (mismo nombre, icono y modo de un solo archivo).
+  Con `UN_SOLO_ARCHIVO = False` se genera una carpeta `dist\Modulo QAQC\` que abre más
+  rápido (no descomprime ~100 MB en cada inicio); en ese caso se distribuye la carpeta.
+- UPX está desactivado: comprimir las DLL de Qt con UPX suele dañarlas y provoca falsos
+  positivos de antivirus.
 - Si se modifica `qaqcbs.ui` en Qt Designer, `build_exe.bat` regenera `ui_qaqcbs.py`
   (o manualmente: `python -m PyQt5.uic.pyuic qaqcbs.ui -o ui_qaqcbs.py`).
 - Los errores técnicos (el .exe no tiene consola) se guardan en
@@ -91,6 +145,8 @@ debe compilarse en Windows.
 | `qaqc_config.py` | Parámetros fijos: límites de detección, pendientes, umbrales de clasificación y fecha límite |
 | `qaqc_estandares.py` | Parámetros de estándares (`estandares.json`), importación/exportación Excel e historial |
 | `qaqc_dialogo_estandares.py` | Ventana *Parámetros de estándares* |
+| `qaqc_informe.py` | Informe mensual en Word (python-docx) |
+| `Grid.ico` | Icono del ejecutable |
 | `ui_qaqcbs.py` | Interfaz compilada desde `qaqcbs.ui` (generada, no editar) |
 | `qaqc.spec`, `build_exe.bat` | Compilación con PyInstaller |
 | `tests/` | Pruebas con datos sintéticos (`python -m pytest tests`) |

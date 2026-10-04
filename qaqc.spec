@@ -1,14 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Compilacion:  pyinstaller qaqc.spec --noconfirm   (o ejecutar build_exe.bat)
 #
-# Genera dist/ModuloQAQC/ModuloQAQC.exe (modo carpeta, abre mas rapido). El
-# modo de un solo archivo descomprime todo el paquete en cada inicio.
-# Para un solo .exe poner UN_SOLO_ARCHIVO = True.
-UN_SOLO_ARCHIVO = False
-NOMBRE = "ModuloQAQC"
-ICONO = "qaqc.ico"  # opcional: si el archivo no existe se usa el icono por defecto
+# UN_SOLO_ARCHIVO = True  -> dist/Modulo QAQC.exe (un solo archivo, como antes).
+# UN_SOLO_ARCHIVO = False -> dist/Modulo QAQC/Modulo QAQC.exe (carpeta; abre mas
+#                            rapido porque no descomprime todo en cada inicio).
+UN_SOLO_ARCHIVO = True
+NOMBRE = "Modulo QAQC"
+ICONO = "Grid.ico"  # si el archivo no existe se usa el icono por defecto
 
 import os
+
+from PyInstaller.utils.hooks import collect_data_files
 
 # Librerias que el entorno suele tener instaladas pero el modulo no usa:
 # excluirlas reduce el tamano y el tiempo de inicio.
@@ -28,12 +30,14 @@ a = Analysis(
     ["qaqc.py"],
     pathex=[],
     binaries=[],
-    # El .ui solo se usa si falta ui_qaqcbs.py (respaldo)
-    datas=[("qaqcbs.ui", ".")],
+    # El .ui solo se usa si falta ui_qaqcbs.py (respaldo). python-docx necesita
+    # sus plantillas (encabezado/pie) para generar el informe Word.
+    # include_py_files: crea la carpeta docx/parts que usa la ruta "parts/../templates".
+    datas=[("qaqcbs.ui", ".")] + collect_data_files("docx", include_py_files=True),
     # pandas carga los motores de Excel de forma dinamica
     hiddenimports=["python_calamine", "openpyxl", "xlsxwriter",
                    "matplotlib.backends.backend_qt5agg", "qaqc_plots",
-                   "qaqc_dialogo_estandares"],
+                   "qaqc_dialogo_estandares", "qaqc_informe", "docx"],
     excludes=EXCLUIR,
     noarchive=False,
 )
@@ -45,6 +49,8 @@ a.datas = [d for d in a.datas if not any(n in d[0] for n in NO_USADOS)]
 pyz = PYZ(a.pure)
 icono = ICONO if os.path.exists(ICONO) else None
 
+# UPX desactivado: comprimir las DLL de Qt con UPX suele dañarlas y genera
+# falsos positivos de antivirus.
 if UN_SOLO_ARCHIVO:
     exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name=NOMBRE,
               console=False, upx=False, icon=icono)

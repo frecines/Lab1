@@ -25,9 +25,10 @@ for _flujo in ("stdout", "stderr"):
         setattr(sys, _flujo, open(os.devnull, "w"))
 
 from PyQt5 import QtWidgets  # noqa: E402
-from PyQt5.QtCore import (QObject, QRegularExpression, QRunnable, Qt,  # noqa: E402
-                          QThreadPool, pyqtSignal)
-from PyQt5.QtGui import QBrush, QColor, QFont, QRegularExpressionValidator  # noqa: E402
+from PyQt5.QtCore import (QObject, QRegularExpression, QRunnable, QSettings,  # noqa: E402
+                          Qt, QThreadPool, QUrl, pyqtSignal)
+from PyQt5.QtGui import (QBrush, QColor, QDesktopServices, QFont,  # noqa: E402
+                         QRegularExpressionValidator)
 from PyQt5.QtWidgets import (QApplication, QCompleter, QFileDialog,  # noqa: E402
                              QMainWindow, QMessageBox, QTableWidgetItem)
 
@@ -163,7 +164,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.botones_qaqc = [self.GENR, self.GBF, self.PGBF, self.GBG, self.PGBG,
                              self.GDC, self.QQDC, self.RDDC, self.GRG, self.QQRG,
                              self.RDRG, self.GDP, self.QQDP, self.RDDP, self.GSTD,
-                             self.CHNH, self.GRI]
+                             self.CHNH, self.GRI, self.INFW]
         self.botones_rma = [self.GRMA, self.QQPRMA, self.RDRMA, self.CUSSL, self.REPRMA]
         for boton in [self.BDQaqc, self.PROC, self.ProcRMA,
                       *self.botones_qaqc, *self.botones_rma]:
@@ -172,6 +173,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         conexiones = {
             self.BDLeyes: self.importar_leyes, self.BDQaqc: self.importar_reporte,
             self.PROC: self.procesar, self.GENR: self.exportar_reporte,
+            self.INFW: self.generar_informe,
             self.OutDir: self.elegir_carpeta,
             self.GBF: lambda: self.graficos_blanco("BF"),
             self.GBG: lambda: self.graficos_blanco("BG"),
@@ -492,6 +494,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.log(f"{titulo}: {len(graficos)} graficos"
                  + (f" guardados en {carpeta}" if guardar else ""))
 
+    # Constructores de listas de graficos: (pestana, archivo_png, figsize, dibujar).
+    # Los usan las ventanas de graficos y el anexo del informe Word.
     def _lista_blanco(self, clave, meses=False, prefijo=""):
         conf, df = cfg.BLANCOS[clave], self.res.blancos[clave]
         sufijo = " Hist" if meses else ""
@@ -501,20 +505,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                                    tasa_error=calc.tasa(df, f"{e}_ERR"), meses=meses))
                 for e in cfg.ELEMENTOS]
 
-    def _lista_estandar(self, clave, meses=False, prefijo=""):
-        conf, df = self.res.conf_std[clave], self.res.estandares[clave]
-        sufijo = " Hist" if meses else ""
-        return [(f"{prefijo}{cfg.ETIQUETA[e]}", f"{conf['titulo']} {cfg.ETIQUETA[e]}{sufijo}",
-                 (10, 6), functools.partial(plots.grafico_estandar, df=df, elemento=e,
-                                            conf=conf, meses=meses))
-                for e in ["CU", "AG", "AS", "MO", "ZN"]]
-
-    @accion("Error al graficar")
-    def graficos_blanco(self, clave):
-        self._mostrar(cfg.BLANCOS[clave]["nombre"], self._lista_blanco(clave))
-
-    @accion("Revisar Rango")
-    def graficos_precedente(self, clave):
+    def _lista_precedente(self, clave):
         nombre, df = cfg.BLANCOS[clave]["nombre"], self.res.blancos[clave]
         graficos = []
         for e in cfg.ELEMENTOS:
@@ -522,19 +513,16 @@ class MyApp(QMainWindow, Ui_MainWindow):
             graficos.append((cfg.ETIQUETA[e], titulo, (10, 6),
                              functools.partial(plots.grafico_precedente, df=df,
                                                elemento=e, titulo=titulo)))
-        self._mostrar(f"Muestras Precedentes vs {nombre}", graficos)
+        return graficos
 
-    @accion("Error al graficar")
-    def graficos_duplicado(self, clave):
+    def _lista_duplicado(self, clave):
         conf, df = cfg.DUPLICADOS[clave], self.res.duplicados[clave]
-        self._mostrar(conf["nombre"], [
-            (cfg.ETIQUETA[e], f"{conf['titulo']} {e}", (8, 8),
-             functools.partial(plots.grafico_duplicado, df=df, elemento=e, conf=conf,
-                               tasa_error=calc.tasa(df, f"{e}_ERR")))
-            for e in cfg.ELEMENTOS])
+        return [(cfg.ETIQUETA[e], f"{conf['titulo']} {e}", (8, 8),
+                 functools.partial(plots.grafico_duplicado, df=df, elemento=e, conf=conf,
+                                   tasa_error=calc.tasa(df, f"{e}_ERR")))
+                for e in cfg.ELEMENTOS]
 
-    @accion("Error al graficar")
-    def graficos_qq_duplicado(self, clave):
+    def _lista_qq_duplicado(self, clave):
         df = self.res.duplicados[clave]
         graficos = []
         for e in cfg.ELEMENTOS:
@@ -543,10 +531,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 plots.grafico_qq, x=df[f"{e}_O"], y=df[f"{e}_D"],
                 titulo=f"Q-Q Plot {clave} {e}", xlabel="Original", ylabel="Duplicado",
                 nombre_x=f"{et} Orig", nombre_y=f"{et} Dup")))
-        self._mostrar(f"Q-Q Plot {cfg.DUPLICADOS[clave]['nombre']}", graficos)
+        return graficos
 
-    @accion("Error al graficar")
-    def graficos_rd_duplicado(self, clave):
+    def _lista_rd_duplicado(self, clave):
         df = self.res.duplicados[clave]
         graficos = []
         for e in cfg.ELEMENTOS:
@@ -555,22 +542,73 @@ class MyApp(QMainWindow, Ui_MainWindow):
             graficos.append((et, titulo, (10, 8), functools.partial(
                 plots.grafico_rd, df=df, col_prom=f"{e}_PROM", col_rd=f"{e}_RD",
                 titulo=titulo, etiqueta=et, id_col="SAMPLE_ORIG")))
-        self._mostrar(f"RD-Plot {cfg.DUPLICADOS[clave]['nombre']}", graficos)
+        return graficos
+
+    def _lista_estandar(self, clave, meses=False, prefijo=""):
+        """Graficos de un estandar, sin los elementos con CV del BV > 5%."""
+        conf, df = self.res.conf_std[clave], self.res.estandares[clave]
+        graficar, _ = estandares.elementos_graficables(conf)
+        sufijo = " Hist" if meses else ""
+        return [(f"{prefijo}{cfg.ETIQUETA[e]}", f"{conf['titulo']} {cfg.ETIQUETA[e]}{sufijo}",
+                 (10, 6), functools.partial(plots.grafico_estandar, df=df, elemento=e,
+                                            conf=conf, meses=meses))
+                for e in ["CU", "AG", "AS", "MO", "ZN"] if e in graficar]
+
+    def _avisar_omitidos_cv(self, claves):
+        omitidos = [f"{self.res.conf_std[c]['codigo']} {cfg.ETIQUETA[e]} (CV {cv:.2f}%)"
+                    for c in claves
+                    for e, cv in estandares.elementos_graficables(self.res.conf_std[c])[1]]
+        if omitidos:
+            self.log(f"No se grafican (CV del BV > {cfg.UMBRAL_CV_ESTANDAR}%): "
+                     + ", ".join(omitidos))
+
+    @accion("Error al graficar")
+    def graficos_blanco(self, clave):
+        self._mostrar(cfg.BLANCOS[clave]["nombre"], self._lista_blanco(clave))
+
+    @accion("Revisar Rango")
+    def graficos_precedente(self, clave):
+        self._mostrar(f"Muestras Precedentes vs {cfg.BLANCOS[clave]['nombre']}",
+                      self._lista_precedente(clave))
+
+    @accion("Error al graficar")
+    def graficos_duplicado(self, clave):
+        self._mostrar(cfg.DUPLICADOS[clave]["nombre"], self._lista_duplicado(clave))
+
+    @accion("Error al graficar")
+    def graficos_qq_duplicado(self, clave):
+        self._mostrar(f"Q-Q Plot {cfg.DUPLICADOS[clave]['nombre']}",
+                      self._lista_qq_duplicado(clave))
+
+    @accion("Error al graficar")
+    def graficos_rd_duplicado(self, clave):
+        self._mostrar(f"RD-Plot {cfg.DUPLICADOS[clave]['nombre']}",
+                      self._lista_rd_duplicado(clave))
 
     @accion("Error al graficar")
     def graficos_estandar(self, clave):
         if not clave:
             raise ValueError("No hay estandares con muestras en el rango procesado.")
-        self._mostrar(self.res.conf_std[clave]["titulo"], self._lista_estandar(clave))
+        self._avisar_omitidos_cv([clave])
+        graficos = self._lista_estandar(clave)
+        if not graficos:
+            raise ValueError("Todos los elementos de este estandar tienen CV del BV mayor a "
+                             f"{cfg.UMBRAL_CV_ESTANDAR}%; no hay graficos que mostrar.")
+        self._mostrar(self.res.conf_std[clave]["titulo"], graficos)
+
+    def _lista_historico(self, incluir_blancos=True):
+        graficos = []
+        if incluir_blancos:
+            for clave in cfg.BLANCOS:
+                graficos += self._lista_blanco(clave, meses=True, prefijo=f"{clave} ")
+        for clave, conf in self.res.conf_std.items():
+            graficos += self._lista_estandar(clave, meses=True, prefijo=f"{conf['codigo']} ")
+        return graficos
 
     @accion("Error al graficar")
     def graficos_historico(self):
-        graficos = []
-        for clave in cfg.BLANCOS:
-            graficos += self._lista_blanco(clave, meses=True, prefijo=f"{clave} ")
-        for clave, conf in self.res.conf_std.items():
-            graficos += self._lista_estandar(clave, meses=True, prefijo=f"{conf['codigo']} ")
-        self._mostrar("Historico por Mes - Blancos y Estandares", graficos)
+        self._avisar_omitidos_cv(self.res.conf_std)
+        self._mostrar("Historico por Mes - Blancos y Estandares", self._lista_historico())
 
     # ------------------------------------------------------ control externo
     def importar_externo(self):
@@ -606,17 +644,15 @@ class MyApp(QMainWindow, Ui_MainWindow):
         for col_sgs, (_, etiqueta, unidad) in cfg.EXTERNO.items():
             yield etiqueta, unidad, calc.pares_externo(self.bd_rma, col_sgs)
 
-    @accion("Error inesperado")
-    def graficos_rma(self):
+    def _lista_rma(self):
         graficos = []
         for et, unidad, p in self._pares_externos():
             dibujar = functools.partial(plots.grafico_rma, pares=p, etiqueta=et, unidad=unidad,
                                         sesgo=calc.sesgo_rma(p["X"], p["Y"]))
             graficos.append((et, f"{et.upper()} RMA PLOT", (9, 8), dibujar))
-        self._mostrar("RMA - Laboratorio Externo", graficos)
+        return graficos
 
-    @accion("Error inesperado")
-    def graficos_qq_rma(self):
+    def _lista_qq_rma(self):
         graficos = []
         for et, _, p in self._pares_externos():
             dibujar = functools.partial(
@@ -624,31 +660,134 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 xlabel="SGS Toromocho", ylabel="Certimin", nombre_x=f"{et} SGS",
                 nombre_y=f"{et} Cert", etiqueta=f"{et.upper()} Q-Q Plot")
             graficos.append((et, f"Q-Q Plot {et.upper()} RMA", (8, 8), dibujar))
-        self._mostrar("Q-Q Plot Lab Ext vs Int", graficos)
+        return graficos
 
-    @accion("Error inesperado")
-    def graficos_rd_rma(self):
+    def _lista_rd_rma(self):
         graficos = []
         for et, _, p in self._pares_externos():
             titulo = f"RMA {et} RD-Plot"
             dibujar = functools.partial(plots.grafico_rd, df=p, col_prom="PROM",
                                         col_rd="RD", titulo=titulo, etiqueta=et)
             graficos.append((et, titulo, (10, 8), dibujar))
-        self._mostrar("RD-Plot Lab Ext vs Int", graficos)
+        return graficos
+
+    def _lista_cuss(self):
+        return [("CuCi vs CuSS", "LinePlot CUSS CUCI", (12, 8),
+                 functools.partial(plots.grafico_cuss, bd_rma=self.bd_rma, incluir_cuci=True)),
+                ("CuSS Cert vs SGS", "LinePlot CUSS SGS vs CERT", (12, 8),
+                 functools.partial(plots.grafico_cuss, bd_rma=self.bd_rma, incluir_cuci=False))]
+
+    @accion("Error inesperado")
+    def graficos_rma(self):
+        self._mostrar("RMA - Laboratorio Externo", self._lista_rma())
+
+    @accion("Error inesperado")
+    def graficos_qq_rma(self):
+        self._mostrar("Q-Q Plot Lab Ext vs Int", self._lista_qq_rma())
+
+    @accion("Error inesperado")
+    def graficos_rd_rma(self):
+        self._mostrar("RD-Plot Lab Ext vs Int", self._lista_rd_rma())
 
     @accion("Error inesperado")
     def graficos_cuss(self):
-        self._mostrar("CuSS Certimin vs SGS", [
-            ("CuCi vs CuSS", "LinePlot CUSS CUCI", (12, 8),
-             functools.partial(plots.grafico_cuss, bd_rma=self.bd_rma, incluir_cuci=True)),
-            ("CuSS Cert vs SGS", "LinePlot CUSS SGS vs CERT", (12, 8),
-             functools.partial(plots.grafico_cuss, bd_rma=self.bd_rma, incluir_cuci=False))])
+        self._mostrar("CuSS Certimin vs SGS", self._lista_cuss())
 
     @accion("No se creo el reporte")
     def exportar_reporte_externo(self):
         ruta = os.path.join(self._carpeta(), "Reporte_QAQC_Ext.xlsx")
         calc.exportar_excel({"RMA SGS-CERT": self.reporte_rma}, ruta)
         self.log(f"Reporte de control externo exportado: {ruta}")
+
+    # -------------------------------------------------------- informe Word
+    MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
+             "Setiembre", "Octubre", "Noviembre", "Diciembre"]
+
+    def _pedir_datos_informe(self, desde, hasta):
+        """Ventana con los datos del memo. Recuerda 'A' y 'De' entre sesiones."""
+        ajustes = QSettings("ModuloQAQC", "Informe")
+        fin = datetime.strptime(hasta, "%d.%m.%Y")
+        dialogo = QtWidgets.QDialog(self)
+        dialogo.setWindowTitle("Informe de Control de Calidad")
+        campos = {
+            "para": QtWidgets.QLineEdit(ajustes.value("para", "")),
+            "de": QtWidgets.QLineEdit(ajustes.value("de", "Equipo Geología Mina")),
+            "fecha": QtWidgets.QLineEdit(datetime.now().strftime("%d/%m/%Y")),
+            "mes": QtWidgets.QLineEdit(self.VMes.text().strip() or self.MESES[fin.month - 1]),
+            "anio": QtWidgets.QLineEdit(self.VAno.text().strip() or str(fin.year)),
+            "periodo_desde": QtWidgets.QLineEdit(desde),
+            "periodo_hasta": QtWidgets.QLineEdit(hasta),
+        }
+        anexo = QtWidgets.QCheckBox("Incluir Anexo A con los gráficos")
+        anexo.setChecked(ajustes.value("anexo", True, type=bool))
+        acumulado = QtWidgets.QCheckBox("Incluir gráficos históricos de estándares "
+                                        "(Análisis del acumulado)")
+        acumulado.setChecked(ajustes.value("acumulado", True, type=bool))
+        formulario = QtWidgets.QFormLayout(dialogo)
+        for etiqueta, clave in (("A:", "para"), ("De:", "de"), ("Fecha del memo:", "fecha"),
+                                ("Mes del informe:", "mes"), ("Año:", "anio"),
+                                ("Datos desde:", "periodo_desde"), ("Datos hasta:", "periodo_hasta")):
+            formulario.addRow(etiqueta, campos[clave])
+        formulario.addRow(anexo)
+        formulario.addRow(acumulado)
+        if self.bd_rma is None:
+            formulario.addRow(QtWidgets.QLabel(
+                "<i>El control externo no está procesado: esa sección quedará pendiente.</i>"))
+        botones = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok
+                                             | QtWidgets.QDialogButtonBox.Cancel)
+        botones.accepted.connect(dialogo.accept)
+        botones.rejected.connect(dialogo.reject)
+        formulario.addRow(botones)
+        dialogo.resize(460, 0)
+        if not dialogo.exec_():
+            return None
+        datos = {k: w.text().strip() for k, w in campos.items()}
+        datos.update(anexo=anexo.isChecked(), acumulado=acumulado.isChecked())
+        for clave in ("para", "de", "anexo", "acumulado"):
+            ajustes.setValue(clave, datos[clave])
+        return datos
+
+    @accion("No se creo el informe")
+    def generar_informe(self):
+        import qaqc_informe
+        desde, hasta = qaqc_informe.fechas_periodo(self.res.bd_total)
+        datos = self._pedir_datos_informe(desde, hasta)
+        if datos is None:
+            return
+        n_externo = self.bd_rma["CU"].count() if self.bd_rma is not None else 0
+        datos.update(res=self.res, reporte_rma=self.reporte_rma if self.bd_rma is not None else None,
+                     ratio=calc.ratio_insercion(self.res.bd_total, n_externo,
+                                                datos["anio"], datos["mes"].upper()),
+                     colores=estandares.colores(self.param.estandares))
+        anexo = []
+        if datos["anexo"]:
+            anexo = [("Duplicado de Campo", self._lista_duplicado("DC")),
+                     ("Duplicado Grueso o de Rechazo", self._lista_duplicado("RG")),
+                     ("Duplicado de Pulpa", self._lista_duplicado("DP")),
+                     ("Blanco Grueso", self._lista_precedente("BG") + self._lista_blanco("BG")),
+                     ("Blanco Fino", self._lista_precedente("BF") + self._lista_blanco("BF")),
+                     ("Materiales de Referencia (Estándares)",
+                      [g for c in self.res.conf_std for g in self._lista_estandar(c)])]
+            if self.bd_rma is not None:
+                anexo += [("Control Externo",
+                           self._lista_rma() + self._lista_qq_rma() + self._lista_rd_rma()),
+                          ("Cu soluble en ácido sulfúrico (CuSS), Cu soluble en ácido cítrico (CuCi)",
+                           self._lista_cuss())]
+        acumulado = self._lista_historico(incluir_blancos=False) if datos["acumulado"] else []
+        self._avisar_omitidos_cv(self.res.conf_std)
+        nombre = f"Informe_de_Control_de_Calidad_{datos['mes']}{datos['anio']}.docx"
+        ruta = os.path.join(self._carpeta(), nombre.replace(" ", "_"))
+        total = sum(len(g) for _, g in anexo) + len(acumulado)
+        self.en_segundo_plano(
+            f"Generando informe Word ({total} graficos, puede tardar un minuto)...",
+            lambda: qaqc_informe.generar(ruta, datos, anexo, acumulado),
+            self._informe_listo, "No se creo el informe")
+
+    def _informe_listo(self, ruta):
+        self.log(f"Informe generado: {ruta}")
+        if QMessageBox.question(self, "Informe generado",
+                                f"Se generó el informe:\n{ruta}\n\n¿Abrirlo ahora?") == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(ruta))
 
     # --------------------------------------------------- ratio de insercion
     @accion("Inserte un Valor")

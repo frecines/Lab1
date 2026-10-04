@@ -225,6 +225,7 @@ def test_leer_excel_estandares():
         for campo in std.CAMPOS:
             for e in cfg.ELEMENTOS_STD:
                 assert conf[campo][e] == pytest.approx(ESTANDARES[control][campo][e], rel=1e-12)
+        assert conf["CV"]["AG"] > 5   # Ag resaltado en amarillo en el Excel
         assert conf["codigo"] == ESTANDARES[control]["codigo"]  # se conserva
 
 
@@ -237,7 +238,7 @@ def test_exportar_e_importar(tmp_path):
         assert leidos[control]["codigo"] == conf["codigo"]
         assert leidos[control]["titulo"] == conf["titulo"]
         for campo in std.CAMPOS:   # Excel guarda 15 cifras significativas
-            assert leidos[control][campo] == pytest.approx(conf[campo], rel=1e-13)
+            assert leidos[control].get(campo, {}) == pytest.approx(conf.get(campo, {}), rel=1e-13)
 
 
 def test_parametros_guardar_e_historial(tmp_path):
@@ -269,3 +270,47 @@ def test_archivo_corrupto_usa_fabrica(tmp_path):
     (tmp_path / std.ARCHIVO).write_text("{no es json", encoding="utf-8")
     p = std.Parametros(str(tmp_path))
     assert p.aviso and "STD-18" in p.estandares
+
+
+# ----------------------------------------------------------- CV > 5% e informe
+def test_cv_omite_graficos():
+    graficar, omitidos = std.elementos_graficables(ESTANDARES["STD-16"])
+    assert graficar == ["CU", "MO", "AS", "ZN"]
+    assert [e for e, _ in omitidos] == ["AG"]
+    # Estandares antiguos sin CV cargado: se grafican todos
+    assert std.elementos_graficables(ESTANDARES["STD-13"])[0] == cfg.ELEMENTOS_STD
+    for control in ("STD-17", "STD-18"):
+        assert "AG" not in std.elementos_graficables(ESTANDARES[control])[0]
+
+
+def test_textos_informe():
+    import qaqc_informe as inf
+    assert inf.lista_es(["Cu", "Ag", "Zn"]) == "Cu, Ag y Zn"
+    rep = pd.DataFrame({"Analito": ["Cu %", "Mo %", "Zn %"], "%F": [2.721, 0.0, 10.884]})
+    assert inf.texto_tasas(rep, "%F") == "Las tasas de error oscilaron entre 0% para Mo y 10.88% para Zn"
+    rep["%F"] = 0.0
+    assert inf.texto_tasas(rep, "%F") == "La tasa de error fue de 0% para todos los elementos"
+
+
+def test_generar_informe(tmp_path, resultados):
+    import functools
+    import docx
+    import qaqc_informe as inf
+    import qaqc_plots as plots
+    ratio = calc.ratio_insercion(resultados.bd_total, 0, "2025", "ENERO")
+    datos = dict(para="Juan Ramos", de="Equipo Geología Mina", fecha="22/02/2025",
+                 mes="Enero", anio="2025", periodo_desde="26.12.2024", periodo_hasta="25.01.2025",
+                 res=resultados, ratio=ratio, reporte_rma=None,
+                 colores=std.colores(ESTANDARES))
+    df = resultados.duplicados["DC"]
+    anexo = [("Duplicado de Campo", [("Cu", "x", (8, 8), functools.partial(
+        plots.grafico_duplicado, df=df, elemento="CU", conf=cfg.DUPLICADOS["DC"], tasa_error=1.0))])]
+    ruta = inf.generar(str(tmp_path / "informe.docx"), datos, anexo)
+    documento = docx.Document(ruta)
+    texto = "\n".join(p.text for p in documento.paragraphs)
+    assert "Reporte de Control de Calidad – Enero 2025" in "\n".join(
+        c.text for c in documento.tables[0].columns[1].cells)
+    assert "un total de 400 muestras" in texto
+    assert "20 duplicados de campo" in texto and "ANEXO A" in texto
+    assert len(documento.inline_shapes) == 1
+    assert len(documento.tables) >= 9   # memo + 7 tablas + grilla del anexo

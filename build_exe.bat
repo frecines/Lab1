@@ -1,6 +1,6 @@
 @echo off
 REM Compila el Modulo QAQC como ejecutable de Windows.
-REM Resultado: dist\ModuloQAQC\ModuloQAQC.exe  (copiar la carpeta completa)
+REM Resultado en la carpeta dist: "Modulo QAQC.exe"
 cd /d "%~dp0"
 
 python -m pip install -r requirements.txt pyinstaller || goto :error
@@ -11,7 +11,7 @@ python -m PyQt5.uic.pyuic qaqcbs.ui -o ui_qaqcbs.py || goto :error
 python -m PyInstaller qaqc.spec --noconfirm --clean || goto :error
 
 echo.
-echo Listo: dist\ModuloQAQC\ModuloQAQC.exe
+echo Listo: carpeta dist (ver UN_SOLO_ARCHIVO en qaqc.spec)
 pause
 exit /b 0
 

@@ -21,7 +21,10 @@ CAJA_ERROR = dict(boxstyle="round,pad=0.3", edgecolor="black", facecolor="lightg
 
 # ----------------------------------------------------------------- helpers
 def _tooltip(fig, artista, texto):
-    """Tooltip al pasar el mouse. `texto(i)` recibe el indice del punto."""
+    """Tooltip al pasar el mouse. `texto(i)` recibe el indice del punto.
+    Las figuras para el informe Word (fig.estatica = True) no los necesitan."""
+    if getattr(fig, "estatica", False):
+        return
     cursor = mplcursors.cursor(artista, hover=True)
 
     @cursor.connect("add")

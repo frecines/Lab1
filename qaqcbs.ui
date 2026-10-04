@@ -226,6 +226,22 @@
             </widget>
            </item>
            <item row="0" column="2">
+            <widget class="QPushButton" name="INFW">
+             <property name="minimumSize">
+              <size>
+               <width>0</width>
+               <height>32</height>
+              </size>
+             </property>
+             <property name="text">
+              <string>Generar Informe Word...</string>
+             </property>
+             <property name="toolTip">
+              <string>Informe mensual de Control de Calidad (.docx) con tablas, textos y Anexo A de gráficos</string>
+             </property>
+            </widget>
+           </item>
+           <item row="0" column="3">
             <spacer name="spacerProceso">
              <property name="orientation">
               <enum>Qt::Horizontal</enum>

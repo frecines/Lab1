@@ -30,11 +30,13 @@ import qaqc_config as cfg
 ARCHIVO = "estandares.json"
 HISTORIAL = "historial_estandares.csv"
 CLAVE_INICIAL = "qaqc"          # se recomienda cambiarla en el primer uso
-CAMPOS = ("BV", "MH", "DE")
+CAMPOS = ("BV", "CV", "MH", "DE")   # CV: coeficiente de variacion (%) del BV
 _SAL = "ModuloQAQC-estandares"
 
 # Valores de fabrica. STD-16/17/18: archivo Estandares_2026.xlsx
-# (BV = media del valor esperado, MH = media historica AAS, DE = Std. Dev.).
+# (BV = media del valor esperado, CV = CV (%) del valor esperado,
+#  MH = media historica AAS, DE = Std. Dev.).
+# STD-13/14/15 no tienen CV cargado: se grafican todos sus elementos.
 PREDETERMINADOS = {
     "STD-13": dict(
         codigo="CHNB13", titulo="Estandar Baja Ley CHNB-13",
@@ -74,6 +76,9 @@ PREDETERMINADOS = {
         BV={"CU": 0.241131884057971, "AG": 2.16432051765731,
             "MO": 0.00415828573173739, "AS": 0.00576315789473684,
             "ZN": 0.0199415384615385},
+        CV={"CU": 2.029311707960067, "AG": 5.800195734231601,
+            "MO": 3.8542348273505223, "AS": 3.404654345017692,
+            "ZN": 3.123980532837728},
         DE={"CU": 0.004019077422834363, "AG": 0.20294772664318628,
             "MO": 9.660292066263082e-05, "AS": 0.000717884427758113,
             "ZN": 0.0007405443768598027}),
@@ -85,6 +90,9 @@ PREDETERMINADOS = {
         BV={"CU": 0.384075, "AG": 3.89402242493882,
             "MO": 0.0100505386682992, "AS": 0.0128643868798608,
             "ZN": 0.0451897058823529},
+        CV={"CU": 2.0752733140195456, "AG": 5.684625055019337,
+            "MO": 2.410471781991903, "AS": 4.7575557626144915,
+            "ZN": 3.7119747884539906},
         DE={"CU": 0.007961391893926327, "AG": 0.21137565422214796,
             "MO": 0.00010868337347859412, "AS": 0.0008807263899075752,
             "ZN": 0.0011599814775632804}),
@@ -96,6 +104,9 @@ PREDETERMINADOS = {
         BV={"CU": 0.596746268656716, "AG": 7.398615536568704,
             "MO": 0.0165168392857143, "AS": 0.0296482142857143,
             "ZN": 0.128048571428571},
+        CV={"CU": 2.0695605732018865, "AG": 5.95927653584465,
+            "MO": 1.8251161745541933, "AS": 2.9954632398196135,
+            "ZN": 3.2972805108297796},
         DE={"CU": 0.004256772636084097, "AG": 0.24325494946538112,
             "MO": 0.0002930295349540777, "AS": 0.0006820101499329248,
             "ZN": 0.0027930854176019585}),
@@ -207,6 +218,10 @@ def validar(estandares):
             if bv is not None and (not np.isfinite(bv) or bv <= 0):
                 raise ValueError(f"{control} {cfg.ETIQUETA[e]}: BV debe ser mayor que 0 "
                                  "o quedar vacio (no certificado).")
+            cv = conf.get("CV", {}).get(e)
+            if cv is not None and (not np.isfinite(cv) or cv < 0):
+                raise ValueError(f"{control} {cfg.ETIQUETA[e]}: CV debe ser un numero >= 0 "
+                                 "o quedar vacio.")
 
 
 def diferencias(antes, despues):
@@ -226,7 +241,7 @@ def diferencias(antes, despues):
                 cambios.append((control, "", campo, a[campo], d[campo]))
         for campo in CAMPOS:
             for e in cfg.ELEMENTOS_STD:
-                va, vd = a[campo].get(e), d[campo].get(e)
+                va, vd = a.get(campo, {}).get(e), d.get(campo, {}).get(e)
                 if va != vd and not (va is not None and vd is not None and np.isclose(va, vd, rtol=0, atol=1e-15)):
                     cambios.append((control, cfg.ETIQUETA[e], campo,
                                     "" if va is None else repr(va), "" if vd is None else repr(vd)))
@@ -270,6 +285,10 @@ def leer_excel(ruta, actuales=None):
     c_std = columna(lambda g, s: "estandar" in g, "Estandar")
     c_el = columna(lambda g, s: "elemento" in g, "Elemento")
     c_bv = columna(lambda g, s: ("esperado" in g or "bv" in g) and "media" in s, "Valor Esperado BV - Media")
+    try:  # opcional
+        c_cv = columna(lambda g, s: ("esperado" in g or "bv" in g) and "cv" in s, "CV")
+    except ValueError:
+        c_cv = None
     c_mh = columna(lambda g, s: "historic" in g and "media" in s, "Valor Historico - Media")
     c_de = columna(lambda g, s: "historic" in g and ("dev" in s or "desv" in s), "Valor Historico - Std. Dev.")
     opcional = {}
@@ -289,11 +308,13 @@ def leer_excel(ruta, actuales=None):
         previo = actuales.get(control, {})
         conf = nuevos.setdefault(control, dict(
             codigo=previo.get("codigo", control), titulo=previo.get("titulo", f"Estandar {control}"),
-            BV={}, MH={}, DE={}))
+            BV={}, CV={}, MH={}, DE={}))
         for clave, j in opcional.items():
             if j is not None and _texto(fila.iloc[j]):
                 conf[clave] = _texto(fila.iloc[j])
-        for campo, j in (("BV", c_bv), ("MH", c_mh), ("DE", c_de)):
+        for campo, j in (("BV", c_bv), ("CV", c_cv), ("MH", c_mh), ("DE", c_de)):
+            if j is None:
+                continue
             valor = pd.to_numeric(fila.iloc[j], errors="coerce")
             if pd.notna(valor):
                 conf[campo][elemento] = float(valor)
@@ -308,23 +329,24 @@ def exportar_excel(estandares, ruta):
     for e in cfg.ELEMENTOS_STD:
         for control, conf in estandares.items():
             filas.append([control, f"{cfg.ETIQUETA[e]} ({'g/T' if e == 'AG' else '%'})",
-                          conf["BV"].get(e), conf["MH"].get(e), conf["DE"].get(e),
+                          conf["BV"].get(e), conf.get("CV", {}).get(e),
+                          conf["MH"].get(e), conf["DE"].get(e),
                           conf["codigo"], conf["titulo"]])
     with pd.ExcelWriter(ruta, engine="xlsxwriter") as w:
         hoja = w.book.add_worksheet("Estandares")
         negrita = w.book.add_format({"bold": True, "align": "center", "border": 1})
-        for j, t in enumerate(["Estándar", "Elemento", "Valor Esperado BV",
+        for j, t in enumerate(["Estándar", "Elemento", "Valor Esperado BV", "",
                                "Valor Histórico (AAS)", "", "Código", "Descripción"]):
             hoja.write(0, j, t, negrita)
-        for j, t in enumerate(["", "", "Media", "Media", "Std. Dev.", "", ""]):
+        for j, t in enumerate(["", "", "Media", "CV (%)", "Media", "Std. Dev.", "", ""]):
             hoja.write(1, j, t, negrita)
         for i, fila in enumerate(filas, start=2):
             for j, v in enumerate(fila):
                 if v is not None:
                     hoja.write(i, j, v)
         hoja.set_column(0, 1, 12)
-        hoja.set_column(2, 4, 16)
-        hoja.set_column(5, 6, 28)
+        hoja.set_column(2, 5, 16)
+        hoja.set_column(6, 7, 28)
 
 
 def _sin_tilde(texto):
@@ -344,3 +366,20 @@ def colores(estandares):
     """Color de fondo para el nombre de cada estandar en las tablas."""
     paleta = ["yellow", "orange", "lightgreen", "lightblue", "pink", "khaki", "plum", "wheat"]
     return {conf["codigo"]: paleta[i % len(paleta)] for i, conf in enumerate(estandares.values())}
+
+
+def elementos_graficables(conf, umbral=None):
+    """(elementos a graficar, [(elemento, cv)] omitidos por CV del BV > umbral).
+
+    Segun Wood (2021) solo se evaluan graficamente los elementos certificados
+    con CV < 5%. Si el CV no esta cargado, el elemento se grafica.
+    """
+    umbral = cfg.UMBRAL_CV_ESTANDAR if umbral is None else umbral
+    graficar, omitidos = [], []
+    for e in cfg.ELEMENTOS_STD:
+        cv = conf.get("CV", {}).get(e)
+        if cv is not None and cv > umbral:
+            omitidos.append((e, cv))
+        else:
+            graficar.append(e)
+    return graficar, omitidos
