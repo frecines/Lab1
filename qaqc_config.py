@@ -85,9 +85,13 @@ ELEMENTOS_STD = ["CU", "AG", "MO", "AS", "ZN"]
 # Los parametros de cada estandar (MH, BV, DE) ya no estan aqui: se editan
 # desde la aplicacion y se guardan en estandares.json (ver qaqc_estandares.py).
 
-# Elementos de un estandar cuyo valor esperado (BV) tiene CV mayor a este %
-# no se grafican (Wood, 2021: solo elementos certificados con CV < 5%).
+# Clasificacion del valor esperado (BV) segun su CV (RSD = 1 DE entre
+# laboratorios / media), como en los certificados de Smee & Associates:
+#   CV <= 5%       Certificado  -> se evalua el sesgo
+#   5% < CV <= 15% Provisional  -> valor referencial: se grafica, sin sesgo
+#   CV > 15%       Indicativo   -> valor referencial: se grafica, sin sesgo
 UMBRAL_CV_ESTANDAR = 5
+UMBRAL_CV_INDICATIVO = 15
 
 # Clasificacion del sesgo (%): |sesgo| <= 5 aceptable, <= 10 cuestionable
 SESGO_ACEPTABLE = 5

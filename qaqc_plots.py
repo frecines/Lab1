@@ -15,6 +15,7 @@ import mplcursors
 
 import qaqc_config as cfg
 from qaqc_calc import curva_hiperbolica, recta_rma, sesgo_estandar
+from qaqc_estandares import categoria_cv, es_referencial
 
 CAJA_ERROR = dict(boxstyle="round,pad=0.3", edgecolor="black", facecolor="lightgray")
 
@@ -199,25 +200,33 @@ def grafico_rd(fig, df, col_prom, col_rd, titulo, etiqueta, id_col="SAMPLE_ID"):
 # -------------------------------------------------------------- estandares
 def grafico_estandar(fig, df, elemento, conf, meses=False):
     et = cfg.ETIQUETA[elemento]
-    titulo = f"{conf['titulo']} {et}"
+    mh, de, bv = conf["MH"][elemento], conf["DE"][elemento], conf["BV"].get(elemento)
+    referencial = bv is not None and es_referencial(conf, elemento)
+    titulo = f"{conf['titulo']} {et}" + (" (valor referencial)" if referencial else "")
     d = df.dropna(subset=[elemento])
     if d.empty:
         return _sin_datos(fig, titulo)
     ax = fig.add_subplot(111)
     _serie_temporal(fig, ax, d, elemento, et, color="blue", relleno="blue")
-    mh, de, bv = conf["MH"][elemento], conf["DE"][elemento], conf["BV"].get(elemento)
-    lineas = [(mh, "orange", f"Media Historica {et}")]
+    lineas = [(mh, "orange", f"Media Historica {et}", "-")]
     if bv is not None:
-        lineas.append((bv, "black", f"BV {et}"))
-    lineas += [(mh + 2 * de, "brown", "MH+2DE"), (mh - 2 * de, "brown", "MH-2DE"),
-               (mh - 3 * de, "red", "MH-3DE"), (mh + 3 * de, "red", "MH+3DE")]
-    for valor, color, nombre in lineas:
-        ax.axhline(valor, color=color, label=nombre)
+        lineas.append((bv, "black", f"BV {et} (referencial)" if referencial else f"BV {et}",
+                       "--" if referencial else "-"))
+    lineas += [(mh + 2 * de, "brown", "MH+2DE", "-"), (mh - 2 * de, "brown", "MH-2DE", "-"),
+               (mh - 3 * de, "red", "MH-3DE", "-"), (mh + 3 * de, "red", "MH+3DE", "-")]
+    for valor, color, nombre, estilo in lineas:
+        ax.axhline(valor, color=color, linestyle=estilo, label=nombre)
     ax.set_title(titulo, fontsize=14, pad=20)
     ax.set_ylabel("Values")
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=3)
     ax.grid(color="gray", linestyle="-", linewidth=0.5)
-    if bv is not None:
+    if referencial:
+        cv = conf["CV"][elemento]
+        ax.text(0.5, 1.015, f"Valor referencial ({categoria_cv(cv)}): CV del BV {cv:.2f}% > "
+                f"{cfg.UMBRAL_CV_ESTANDAR}%, sin evaluacion de sesgo",
+                transform=ax.transAxes, ha="center", va="bottom", fontsize=10,
+                color="#1F4E9A", style="italic")
+    elif bv is not None:
         _anotar(ax, f"Sesgo: {_fmt(sesgo_estandar(d, conf, elemento), 2)}%", (0.8, -0.25))
     if meses:
         _marcar_meses(ax, d)

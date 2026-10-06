@@ -57,7 +57,8 @@ except ImportError:  # en desarrollo, si no se compilo, se lee el .ui
 
 FILTRO_EXCEL = "Archivos Excel (*.xlsx *.xlsm *.xls)"
 COLOR_CLASE = {"ACEPTABLE": "green", "CUESTIONABLE": "orange",
-               "INACEPTABLE": "red", "No Certificado": "black", "Sin datos": "gray"}
+               "INACEPTABLE": "red", "No Certificado": "black", "Sin datos": "gray",
+               "REFERENCIAL": "#1F4E9A"}
 GRIS = QColor("lightgray")
 ARCHIVO_ERRORES = os.path.join(os.path.expanduser("~"), "QAQC_errores.log")
 
@@ -545,22 +546,24 @@ class MyApp(QMainWindow, Ui_MainWindow):
         return graficos
 
     def _lista_estandar(self, clave, meses=False, prefijo=""):
-        """Graficos de un estandar, sin los elementos con CV del BV > 5%."""
+        """Graficos de un estandar (los elementos con CV del BV > 5% se grafican
+        como valor referencial)."""
         conf, df = self.res.conf_std[clave], self.res.estandares[clave]
-        graficar, _ = estandares.elementos_graficables(conf)
         sufijo = " Hist" if meses else ""
         return [(f"{prefijo}{cfg.ETIQUETA[e]}", f"{conf['titulo']} {cfg.ETIQUETA[e]}{sufijo}",
                  (10, 6), functools.partial(plots.grafico_estandar, df=df, elemento=e,
                                             conf=conf, meses=meses))
-                for e in ["CU", "AG", "AS", "MO", "ZN"] if e in graficar]
+                for e in ["CU", "AG", "AS", "MO", "ZN"]]
 
-    def _avisar_omitidos_cv(self, claves):
-        omitidos = [f"{self.res.conf_std[c]['codigo']} {cfg.ETIQUETA[e]} (CV {cv:.2f}%)"
-                    for c in claves
-                    for e, cv in estandares.elementos_graficables(self.res.conf_std[c])[1]]
-        if omitidos:
-            self.log(f"No se grafican (CV del BV > {cfg.UMBRAL_CV_ESTANDAR}%): "
-                     + ", ".join(omitidos))
+    def _avisar_referenciales(self, claves):
+        referenciales = [f"{self.res.conf_std[c]['codigo']} {cfg.ETIQUETA[e]} "
+                         f"(CV {cv:.2f}%, {categoria})"
+                         for c in claves
+                         for e, cv, categoria in estandares.elementos_referenciales(
+                             self.res.conf_std[c])]
+        if referenciales:
+            self.log(f"Valores referenciales (CV del BV > {cfg.UMBRAL_CV_ESTANDAR}%, sin "
+                     "evaluacion de sesgo): " + ", ".join(referenciales))
 
     @accion("Error al graficar")
     def graficos_blanco(self, clave):
@@ -589,12 +592,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
     def graficos_estandar(self, clave):
         if not clave:
             raise ValueError("No hay estandares con muestras en el rango procesado.")
-        self._avisar_omitidos_cv([clave])
-        graficos = self._lista_estandar(clave)
-        if not graficos:
-            raise ValueError("Todos los elementos de este estandar tienen CV del BV mayor a "
-                             f"{cfg.UMBRAL_CV_ESTANDAR}%; no hay graficos que mostrar.")
-        self._mostrar(self.res.conf_std[clave]["titulo"], graficos)
+        self._avisar_referenciales([clave])
+        self._mostrar(self.res.conf_std[clave]["titulo"], self._lista_estandar(clave))
 
     def _lista_historico(self, incluir_blancos=True):
         graficos = []
@@ -607,7 +606,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
     @accion("Error al graficar")
     def graficos_historico(self):
-        self._avisar_omitidos_cv(self.res.conf_std)
+        self._avisar_referenciales(self.res.conf_std)
         self._mostrar("Historico por Mes - Blancos y Estandares", self._lista_historico())
 
     # ------------------------------------------------------ control externo
@@ -774,7 +773,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                           ("Cu soluble en ácido sulfúrico (CuSS), Cu soluble en ácido cítrico (CuCi)",
                            self._lista_cuss())]
         acumulado = self._lista_historico(incluir_blancos=False) if datos["acumulado"] else []
-        self._avisar_omitidos_cv(self.res.conf_std)
+        self._avisar_referenciales(self.res.conf_std)
         nombre = f"Informe_de_Control_de_Calidad_{datos['mes']}{datos['anio']}.docx"
         ruta = os.path.join(self._carpeta(), nombre.replace(" ", "_"))
         total = sum(len(g) for _, g in anexo) + len(acumulado)

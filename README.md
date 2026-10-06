@@ -69,16 +69,26 @@ estructura del informe de enero 2025:
 - Análisis del acumulado (gráficos históricos por mes de los estándares) y
   **Anexo A** con todos los gráficos (opcionales). Unos 70-90 gráficos tardan ~15 s.
 
-## Estándares con CV > 5%
+## Estándares con CV > 5% (valores referenciales)
 
-Cada estándar tiene, por elemento, el **CV (%) del valor esperado BV** (columna nueva en
-*Parámetros de estándares*; se importa del Excel de estándares, columna "CV (%)").
-Los elementos con **CV > 5%** (Wood, 2021) **no se grafican**: ni en la ventana del
-estándar, ni en el histórico, ni en el Anexo del informe. El registro de actividad indica
-cuáles se omitieron. Con los valores de `Estandares_2026.xlsx` se omite **Ag** en
-STD-16, STD-17 y STD-18. El umbral está en `UMBRAL_CV_ESTANDAR` (`qaqc_config.py`).
-Los estándares STD-13/14/15 no tienen CV cargado, por lo que se grafican todos sus
-elementos hasta que se ingrese su CV.
+Cada estándar tiene, por elemento, el **CV (%) del valor esperado BV** (RSD = desviación
+estándar entre laboratorios / media certificada; columna *CV* en *Parámetros de
+estándares*, se importa del Excel de estándares). Según los certificados de MRC
+(Smee & Associates): CV ≤ 5% **Certificado**; 5-15% **Provisional** (usar con precaución);
+> 15% **Indicativo** (no sirve para monitorear exactitud).
+
+Los elementos con **CV > 5%**:
+- **se grafican** (ventanas, histórico y Anexo), con el título "(valor referencial)",
+  la línea BV punteada y la nota "Valor referencial (Provisional): CV del BV 5.80% > 5%,
+  sin evaluación de sesgo";
+- en el **cuadro resumen** aparecen sin sesgo y con Clase **REFERENCIAL**
+  (se mantienen N° muestras, medias, límites y # / % fallidos fuera de MH ± 3DE);
+- en el **informe Word** se explica el criterio del certificado, se listan en el texto de
+  estándares y en las conclusiones, y la tabla de MRCs indica la categoría de cada elemento.
+
+Con `Estandares_2026.xlsx`, Ag de STD-16, STD-17 y STD-18 (CV 5.80%, 5.68%, 5.96%) es
+Provisional → referencial. STD-13/14/15 no tienen CV cargado y se evalúan como antes.
+Umbrales en `qaqc_config.py` (`UMBRAL_CV_ESTANDAR`, `UMBRAL_CV_INDICATIVO`).
 
 ## Prueba en Spyder (antes de compilar)
 

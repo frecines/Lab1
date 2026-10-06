@@ -363,23 +363,36 @@ def _hay_calamine():
 
 
 def colores(estandares):
-    """Color de fondo para el nombre de cada estandar en las tablas."""
-    paleta = ["yellow", "orange", "lightgreen", "lightblue", "pink", "khaki", "plum", "wheat"]
-    return {conf["codigo"]: paleta[i % len(paleta)] for i, conf in enumerate(estandares.values())}
+    """Color de fondo para el nombre de cada estandar en las tablas: ley baja
+    (CHNB..) amarillo, media (CHNM..) naranja, alta (CHNA..) verde, como en los
+    informes anteriores; otros codigos toman colores de una paleta."""
+    por_ley = {"CHNB": "yellow", "CHNM": "orange", "CHNA": "lightgreen"}
+    paleta = ["lightblue", "pink", "khaki", "plum", "wheat"]
+    resultado, k = {}, 0
+    for conf in estandares.values():
+        color = por_ley.get(conf["codigo"][:4].upper())
+        if color is None:
+            color, k = paleta[k % len(paleta)], k + 1
+        resultado[conf["codigo"]] = color
+    return resultado
 
 
-def elementos_graficables(conf, umbral=None):
-    """(elementos a graficar, [(elemento, cv)] omitidos por CV del BV > umbral).
+def categoria_cv(cv):
+    """Certificado / Provisional / Indicativo segun el CV (%) del BV; None si no hay CV."""
+    if cv is None or pd.isna(cv):
+        return None
+    if cv <= cfg.UMBRAL_CV_ESTANDAR:
+        return "Certificado"
+    return "Provisional" if cv <= cfg.UMBRAL_CV_INDICATIVO else "Indicativo"
 
-    Segun Wood (2021) solo se evaluan graficamente los elementos certificados
-    con CV < 5%. Si el CV no esta cargado, el elemento se grafica.
-    """
-    umbral = cfg.UMBRAL_CV_ESTANDAR if umbral is None else umbral
-    graficar, omitidos = [], []
-    for e in cfg.ELEMENTOS_STD:
-        cv = conf.get("CV", {}).get(e)
-        if cv is not None and cv > umbral:
-            omitidos.append((e, cv))
-        else:
-            graficar.append(e)
-    return graficar, omitidos
+
+def es_referencial(conf, elemento):
+    """True si el BV del elemento tiene CV > 5%: se grafica como valor
+    referencial y no se informa su sesgo."""
+    return categoria_cv(conf.get("CV", {}).get(elemento)) in ("Provisional", "Indicativo")
+
+
+def elementos_referenciales(conf):
+    """[(elemento, cv, categoria)] con CV del BV mayor a 5%."""
+    return [(e, conf["CV"][e], categoria_cv(conf["CV"][e]))
+            for e in cfg.ELEMENTOS_STD if es_referencial(conf, e)]

@@ -22,7 +22,7 @@ import qaqc_estandares as std
 
 COL_STD = ["Control (en CONTROLES)", "Código", "Descripción (título de gráficos)"]
 COL_VAL = ["Elemento", "BV - Valor esperado\n(vacío = no certificado)",
-           "CV del BV (%)\n(> 5% no se grafica)", "MH - Media histórica",
+           "CV del BV (%)\n(> 5% = valor referencial)", "MH - Media histórica",
            "DE - Desviación estándar"]
 CAMPOS_VAL = ("BV", "CV", "MH", "DE")
 

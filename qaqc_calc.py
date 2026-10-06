@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 import qaqc_config as cfg
+from qaqc_estandares import es_referencial
 
 COLS_REPORTE_QAQC = ["SAMPLE_ID", "CONTROLES", "MES", "Malla", "Scheme"]
 
@@ -336,7 +337,9 @@ def reporte_estandares(estandares, conf_std, por_analito=False):
         df = estandares[clave]
         for e in cfg.ELEMENTOS_STD:
             mh, de, bv = conf["MH"][e], conf["DE"][e], conf["BV"].get(e)
-            sesgo = sesgo_estandar(df, conf, e)
+            # BV con CV > 5% (Provisional/Indicativo): valor referencial, sin sesgo
+            referencial = bv is not None and es_referencial(conf, e)
+            sesgo = np.nan if referencial else sesgo_estandar(df, conf, e)
             filas.append({
                 "Nombre\nSTD": conf["codigo"],
                 "Analito": cfg.ANALITO[e],
@@ -347,7 +350,7 @@ def reporte_estandares(estandares, conf_std, por_analito=False):
                 "Lim. de\nControl\nMH-2STD": mh - 2 * de,
                 "Lim. de\nControl\nMH+2STD": mh + 2 * de,
                 "Sesgo(%)": sesgo,
-                "Clase": clasificar_sesgo(sesgo, bv is not None),
+                "Clase": "REFERENCIAL" if referencial else clasificar_sesgo(sesgo, bv is not None),
                 "# Fallidos": int(df[f"{e}_OUT"].sum()),
                 "% Fallidos": tasa(df, f"{e}_OUT"),
                 "_orden": cfg.ELEMENTOS_STD.index(e),

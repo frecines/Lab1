@@ -273,14 +273,40 @@ def test_archivo_corrupto_usa_fabrica(tmp_path):
 
 
 # ----------------------------------------------------------- CV > 5% e informe
-def test_cv_omite_graficos():
-    graficar, omitidos = std.elementos_graficables(ESTANDARES["STD-16"])
-    assert graficar == ["CU", "MO", "AS", "ZN"]
-    assert [e for e, _ in omitidos] == ["AG"]
-    # Estandares antiguos sin CV cargado: se grafican todos
-    assert std.elementos_graficables(ESTANDARES["STD-13"])[0] == cfg.ELEMENTOS_STD
-    for control in ("STD-17", "STD-18"):
-        assert "AG" not in std.elementos_graficables(ESTANDARES[control])[0]
+def test_cv_valores_referenciales(resultados):
+    # STD-16/17/18: Ag con CV > 5% (Provisional) -> referencial
+    for control in ("STD-16", "STD-17", "STD-18"):
+        refs = std.elementos_referenciales(ESTANDARES[control])
+        assert [(e, cat) for e, _, cat in refs] == [("AG", "Provisional")]
+    assert std.categoria_cv(4.9) == "Certificado"
+    assert std.categoria_cv(5.8) == "Provisional"
+    assert std.categoria_cv(16) == "Indicativo"
+    assert std.categoria_cv(None) is None
+    # STD-13 sin CV cargado: ningun referencial
+    assert std.elementos_referenciales(ESTANDARES["STD-13"]) == []
+
+
+def test_reporte_referencial_sin_sesgo():
+    leyes, sec = datos_sinteticos()
+    sec["CONTROLES"] = sec["CONTROLES"].replace({"STD-13": "STD-16"})
+    total, _ = calc.unir_bases(leyes, sec, 1000, 1399)
+    res = calc.ResultadosQAQC(total, ESTANDARES)
+    rep = res.reportes["Estandares"].set_index(["Nombre\nSTD", "Analito"])
+    ag = rep.loc[("CHNB16", "Ag gr/tn")]
+    assert ag["Clase"] == "REFERENCIAL" and pd.isna(ag["Sesgo(%)"])
+    assert ag["Media\nCertificada\n(BV)"] == pytest.approx(2.1643, abs=1e-4)
+    assert pd.notna(rep.loc[("CHNB16", "Cu %"), "Sesgo(%)"])        # certificado: con sesgo
+    # el grafico del elemento referencial se genera
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    import qaqc_plots as plots
+    fig = Figure()
+    plots.grafico_estandar(fig, res.estandares["STD-16"], "AG", res.conf_std["STD-16"])
+    textos = [t.get_text() for t in fig.axes[0].texts]
+    assert any("Valor referencial (Provisional)" in t for t in textos)
+    assert not any(t.startswith("Sesgo") for t in textos)
+    assert "(valor referencial)" in fig.axes[0].get_title()
 
 
 def test_textos_informe():

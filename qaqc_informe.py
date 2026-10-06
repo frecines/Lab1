@@ -29,12 +29,24 @@ import qaqc_config as cfg
 import qaqc_estandares as estandares
 
 COLOR_CLASE = {"ACEPTABLE": RGBColor(0x00, 0x80, 0x00), "CUESTIONABLE": RGBColor(0xE6, 0x8A, 0x00),
-               "INACEPTABLE": RGBColor(0xFF, 0x00, 0x00)}
+               "INACEPTABLE": RGBColor(0xFF, 0x00, 0x00), "REFERENCIAL": RGBColor(0x1F, 0x4E, 0x9A)}
 GRIS = "D9D9D9"
 COLOR_HEX = {"yellow": "FFFF00", "orange": "FFA500", "lightgreen": "90EE90",
              "lightblue": "ADD8E6", "pink": "FFC0CB", "khaki": "F0E68C",
              "plum": "DDA0DD", "wheat": "F5DEB3", "green": "008000"}
 DPI_FIGURAS = 120
+
+# Criterio de los certificados de MRC (Smee & Associates Consulting Ltd.)
+CRITERIO_CV = (
+    "De acuerdo con los certificados de análisis de los MRC (Smee & Associates Consulting "
+    "Ltd.), la media certificada y la desviación estándar entre laboratorios se obtienen de un "
+    "round robin con varios laboratorios. Los elementos con desviación estándar relativa (RSD o "
+    f"CV) cercana o menor a {cfg.UMBRAL_CV_ESTANDAR}% se clasifican como Certificados; entre "
+    f"{cfg.UMBRAL_CV_ESTANDAR}% y {cfg.UMBRAL_CV_INDICATIVO}% como Provisionales, que deben "
+    "usarse con precaución al evaluar la exactitud de un análisis individual; y mayores a "
+    f"{cfg.UMBRAL_CV_INDICATIVO}% como Indicativos, que no pueden usarse para monitorear la "
+    f"exactitud. Por ello, los elementos con CV mayor a {cfg.UMBRAL_CV_ESTANDAR}% se grafican y "
+    "se presentan como valores referenciales, sin evaluación de sesgo.")
 
 
 # ----------------------------------------------------------------- textos
@@ -306,17 +318,17 @@ def tabla_estandares_usados(conf_std):
     """Tabla de MRCs utilizados (nombre, elemento, MH, BV, CV, limites, observaciones)."""
     filas = []
     for conf in conf_std.values():
-        _, omitidos = estandares.elementos_graficables(conf)
-        omitidos = dict(omitidos)
         for e in cfg.ELEMENTOS_STD:
             mh, de = conf["MH"][e], conf["DE"][e]
             bv, cv = conf["BV"].get(e), conf.get("CV", {}).get(e)
-            if e in omitidos:
-                obs = f"CV > {cfg.UMBRAL_CV_ESTANDAR}%: no se grafica."
+            categoria = estandares.categoria_cv(cv)
+            if bv is not None and estandares.es_referencial(conf, e):
+                obs = (f"{categoria} (CV > {cfg.UMBRAL_CV_ESTANDAR}%): valor referencial, "
+                       "sin evaluación de sesgo.")
             elif bv is None:
                 obs = "Sin valor certificado (provisional)."
             else:
-                obs = ""
+                obs = categoria or ""
             filas.append([conf["codigo"], cfg.ANALITO[e], round(mh, 4),
                           "" if bv is None else round(bv, 4),
                           "" if cv is None else round(cv, 2),
@@ -430,9 +442,9 @@ def generar(ruta, datos, anexo, acumulado=(), avance=None):
     detalle = lista_es(f"{len(res.estandares[c])} muestras {conf['codigo']}"
                        for c, conf in res.conf_std.items())
     std = rep["Estandares por Analito"]
-    omitidos = [f"{conf['codigo']} {cfg.ETIQUETA[e]} (CV {cv:.2f}%)"
-                for conf in res.conf_std.values()
-                for e, cv in estandares.elementos_graficables(conf)[1]]
+    referenciales = [f"{conf['codigo']} {cfg.ETIQUETA[e]} (CV {cv:.2f}%)"
+                     for conf in res.conf_std.values()
+                     for e, cv, _ in estandares.elementos_referenciales(conf)]
     cuestionables = elementos_con_clase(std, "Clase", "CUESTIONABLE", prefijo="Nombre\nSTD")
     inaceptables = elementos_con_clase(std, "Clase", "INACEPTABLE", prefijo="Nombre\nSTD")
     if not inaceptables and not cuestionables:
@@ -448,8 +460,9 @@ def generar(ruta, datos, anexo, acumulado=(), avance=None):
         f"En total, se procesaron {n_std} muestras de MRCs" + (f" ({detalle})" if detalle else "")
         + f", lo que representa una tasa de inserción de {ri_std}%. Se prepararon gráficos de control "
         "para cada elemento y para cada tipo de MR certificado (Anexo A), según recomendación de Wood. "
-        + (f"No se graficaron los elementos cuyo valor esperado tiene CV mayor a "
-           f"{cfg.UMBRAL_CV_ESTANDAR}%: {lista_es(omitidos)}. " if omitidos else "")
+        + (f"Los elementos cuyo valor esperado (BV) tiene CV mayor a {cfg.UMBRAL_CV_ESTANDAR}% "
+           f"({lista_es(referenciales)}) se consideran valores referenciales: se grafican, pero "
+           "no se evalúa su sesgo (ver Comentarios Adicionales). " if referenciales else "")
         + f"{exactitud} El resumen de la evaluación de los MRCs se presenta en la Tabla "
         f"{inf.n_tabla + 1}.")
     inf.leyenda("Resumen de los Materiales de Referencia")
@@ -457,7 +470,10 @@ def generar(ruta, datos, anexo, acumulado=(), avance=None):
     inf.parrafo(f"Clasificación de la exactitud: aceptable: sesgo de 0 a ±{cfg.SESGO_ACEPTABLE}%; "
                 f"cuestionable: sesgo de +{cfg.SESGO_ACEPTABLE} a +{cfg.SESGO_CUESTIONABLE}% o de "
                 f"-{cfg.SESGO_ACEPTABLE}% a -{cfg.SESGO_CUESTIONABLE}%; inaceptable: sesgo superior "
-                f"a {cfg.SESGO_CUESTIONABLE}% o inferior a -{cfg.SESGO_CUESTIONABLE}%. ",
+                f"a {cfg.SESGO_CUESTIONABLE}% o inferior a -{cfg.SESGO_CUESTIONABLE}%. "
+                + (f"REFERENCIAL: elemento con CV del valor esperado mayor a "
+                   f"{cfg.UMBRAL_CV_ESTANDAR}%, presentado solo como referencia. "
+                   if referenciales else ""),
                 ("PENDIENTE", "[Interpretación]"))
 
     # Check externo
@@ -519,9 +535,8 @@ def generar(ruta, datos, anexo, acumulado=(), avance=None):
     inf.parrafo("Para MRCs, se están utilizando las medias y desviaciones estándar históricas para el "
                 "análisis de exactitud en los materiales de referencia, de acuerdo con la recomendación "
                 "de Wood (2021).")
-    inf.parrafo(f"Solamente se están analizando el elemento certificado de cada tipo de MRCs "
-                f"(CV<{cfg.UMBRAL_CV_ESTANDAR}%), según recomendación de Wood (2021). Los MRCs "
-                f"utilizados se presentan en la Tabla {inf.n_tabla + 1}.")
+    inf.parrafo(f"{CRITERIO_CV} Los MRCs utilizados y la categoría de cada elemento se "
+                f"presentan en la Tabla {inf.n_tabla + 1}.")
     inf.leyenda("Materiales de Referencia utilizados en el periodo")
     inf.tabla(tabla_estandares_usados(res.conf_std), col_color=0, colores=datos["colores"])
 
@@ -547,7 +562,9 @@ def generar(ruta, datos, anexo, acumulado=(), avance=None):
         f"químico {texto_aceptabilidad(bf_mal)}.",
         "A partir de resultados de sesgo de estándares, se concluye que la exactitud analítica es "
         + (texto_aceptabilidad(inaceptables + cuestionables, "todos los elementos estudiados")
-           + (" (ver Tabla de Materiales de Referencia)." if inaceptables or cuestionables else ".")),
+           + (" (ver Tabla de Materiales de Referencia)." if inaceptables or cuestionables else "."))
+        + (f" {lista_es(referenciales)} se evaluaron solo como valores referenciales por tener "
+           f"CV del valor esperado mayor a {cfg.UMBRAL_CV_ESTANDAR}%." if referenciales else ""),
     ]
     if general_mal is not None:
         conclusiones.append("Del RMA, que evalúa la exactitud de SGS Toromocho a partir de muestras "
