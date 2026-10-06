@@ -323,8 +323,7 @@ def tabla_estandares_usados(conf_std):
             bv, cv = conf["BV"].get(e), conf.get("CV", {}).get(e)
             categoria = estandares.categoria_cv(cv)
             if bv is not None and estandares.es_referencial(conf, e):
-                obs = (f"{categoria} (CV > {cfg.UMBRAL_CV_ESTANDAR}%): valor referencial, "
-                       "sin evaluación de sesgo.")
+                obs = f"{categoria} (CV > {cfg.UMBRAL_CV_ESTANDAR}%): valor referencial."
             elif bv is None:
                 obs = "Sin valor certificado (provisional)."
             else:

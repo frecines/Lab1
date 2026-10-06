@@ -223,7 +223,7 @@ def grafico_estandar(fig, df, elemento, conf, meses=False):
     if referencial:
         cv = conf["CV"][elemento]
         ax.text(0.5, 1.015, f"Valor referencial ({categoria_cv(cv)}): CV del BV {cv:.2f}% > "
-                f"{cfg.UMBRAL_CV_ESTANDAR}%, sin evaluacion de sesgo",
+                f"{cfg.UMBRAL_CV_ESTANDAR}%",
                 transform=ax.transAxes, ha="center", va="bottom", fontsize=10,
                 color="#1F4E9A", style="italic")
     elif bv is not None:

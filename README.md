@@ -79,8 +79,7 @@ estándares*, se importa del Excel de estándares). Según los certificados de M
 
 Los elementos con **CV > 5%**:
 - **se grafican** (ventanas, histórico y Anexo), con el título "(valor referencial)",
-  la línea BV punteada y la nota "Valor referencial (Provisional): CV del BV 5.80% > 5%,
-  sin evaluación de sesgo";
+  la línea BV punteada y la nota "Valor referencial (Provisional): CV del BV 5.80% > 5%";
 - en el **cuadro resumen** aparecen sin sesgo y con Clase **REFERENCIAL**
   (se mantienen N° muestras, medias, límites y # / % fallidos fuera de MH ± 3DE);
 - en el **informe Word** se explica el criterio del certificado, se listan en el texto de
