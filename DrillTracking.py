@@ -2222,6 +2222,22 @@ class MyApp(QMainWindow, Ui_MainWindow):
             return pd.DataFrame(columns=columnas)
         return pd.DataFrame(movimientos)[columnas].sort_values(['Fecha', 'Maquina']).reset_index(drop=True)
 
+    def _resumen_taladros(self):
+        """Taladros perforados vs planeados del proyecto, contando por PLATAFORMA (no por
+        Sondaje/DDH): cuando una perforación se detiene por una falla operativa se perfora
+        un "gemelo" desde la MISMA plataforma con otro identificador (ej. "33" y "33B" en
+        Control de Proceso, mismas coordenadas de collar), y ambos deben contar como un solo
+        taladro planeado, no dos — de ahí las plataformas duplicadas que se ven en ese Excel.
+        "Perforados" = plataformas cuyo sondaje (el vigente, no el gemelo abandonado) quedó
+        en estado "Ejecutado". Requiere Control de Proceso cargado (self.BD_Union_total); si
+        no está disponible devuelve None."""
+        if not hasattr(self, 'BD_Union_total'):
+            return None
+        plataformas = self.BD_Union_total.dropna(subset=['Plataforma'])
+        planeados = plataformas['Plataforma'].nunique()
+        perforados = plataformas.loc[plataformas['Estado'] == 'Ejecutado', 'Plataforma'].nunique()
+        return perforados, planeados
+
     def _build_df_plot_plano(self):
         """Prepara df_plot para la Vista en Planta: proyección de días restantes, jittering de
         coordenadas duplicadas y campos formateados para el hover / las etiquetas. Reutilizado
@@ -2313,6 +2329,35 @@ class MyApp(QMainWindow, Ui_MainWindow):
         else:
             print("Topografía omitida: Ruta no definida o no encontrada.")
 
+    def _etiquetar_puntos_plano(self, ax, sub, fontsize, offset_paso=25):
+        """Etiqueta TODOS los puntos de `sub` (ya filtrado a un solo estado) con su
+        plataforma y, si hay una máquina asociada, el nombre de la máquina — separando
+        verticalmente los que comparten coordenadas (gemelos perforados por una falla
+        operativa, ver _build_resumen_sondajes) para que no se superpongan las etiquetas.
+        Antes esto solo se hacía para "Perforando"; "Preinicio" quedaba sin ninguna
+        etiqueta porque el agrupamiento de coordenadas duplicadas se calculaba una sola vez
+        de forma GLOBAL en _build_df_plot_plano (coord_group), así que un gemelo en
+        Preinicio con las mismas coordenadas que su par en otro estado (ej. uno ya
+        "Perforando") nunca caía en el primer lugar del grupo y no se etiquetaba. Aquí el
+        agrupamiento se recalcula DENTRO del propio subconjunto de `sub`, así que cada
+        estado etiqueta sus propios puntos sin depender de qué otro estado haya tomado el
+        primer lugar en esa coordenada. Devuelve la lista de Text creados (para poder
+        mostrarlos/ocultarlos junto con la capa, ver PlotPlano)."""
+        sub = sub.copy()
+        sub['n_en_plataforma'] = sub.groupby(['ESTE', 'NORTE'])['Sondaje_fmt'].transform('count')
+        sub['idx_en_plataforma'] = sub.groupby(['ESTE', 'NORTE']).cumcount()
+        textos = []
+        for _, r in sub.iterrows():
+            texto = r['Plataforma'] if r['n_en_plataforma'] == 1 else f"{r['Plataforma']} ({r['Sondaje_fmt']})"
+            if r['Maquina_fmt'] not in ('S/M', '-', ''):
+                texto += f"\n{r['Maquina_fmt']}"
+            offset_y = r['idx_en_plataforma'] * offset_paso
+            txt = ax.text(r["ESTE"] - 12, r["NORTE"] + offset_y, texto, fontsize=fontsize,
+                          ha='right', va='center', color='#333333', zorder=5, fontweight='bold')
+            txt.set_clip_on(True)
+            textos.append(txt)
+        return textos
+
     def PlotPlano(self):
             self.Mensajes.clear()
             try:
@@ -2341,23 +2386,13 @@ class MyApp(QMainWindow, Ui_MainWindow):
                         
                         # Las etiquetas de texto se mantienen en la coordenada REAL para no duplicar nombres
                         lbls = []
-                        if estado == "Perforando":
-                            # Muy pocos sondajes están "Perforando" a la vez, así que aquí SÍ
-                            # etiquetamos todos (en vez de solo coord_group==0): si hay
-                            # perforación paralela en la misma plataforma (p.ej. dos taladros
-                            # desde EE-45), antes se perdía la etiqueta del segundo. Se separan
-                            # verticalmente y se agrega el sondaje entre paréntesis para
-                            # diferenciarlas.
-                            sub_lbl = sub.copy()
-                            sub_lbl['n_en_plataforma'] = sub_lbl.groupby(['ESTE', 'NORTE'])['Sondaje_fmt'].transform('count')
-                            sub_lbl['idx_en_plataforma'] = sub_lbl.groupby(['ESTE', 'NORTE']).cumcount()
-                            for _, r in sub_lbl.iterrows():
-                                texto = r['Plataforma'] if r['n_en_plataforma'] == 1 else f"{r['Plataforma']} ({r['Sondaje_fmt']})"
-                                offset_y = r['idx_en_plataforma'] * 25
-                                txt = ax.text(r["ESTE"]-12, r["NORTE"] + offset_y, texto, fontsize=6,
-                                              ha='right', va='center', color='#333333', zorder=5, fontweight='bold')
-                                txt.set_clip_on(True)
-                                lbls.append(txt)
+                        if estado in ("Perforando", "Preinicio"):
+                            # Muy pocos sondajes están "Perforando"/"Preinicio" a la vez, así
+                            # que aquí SÍ etiquetamos todos con plataforma + máquina (ver
+                            # _etiquetar_puntos_plano), en vez de solo el resto de estados
+                            # (Programado/Ejecutado/Plataforma, con decenas de puntos) que se
+                            # dejan sin etiqueta para que el mapa no se sature.
+                            lbls = self._etiquetar_puntos_plano(ax, sub, fontsize=6)
                         else:
                             for _, r in sub.iterrows():
                                 # Solo dibujar etiqueta si es el primer sondaje del grupo en esa coordenada para evitar amontonamiento
@@ -2735,12 +2770,15 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 QMessageBox.critical(self, "Error al Graficar", f"Error crítico: {str(e)}")
                 self.Mensajes.setText("Ocurrio algun error")
 
-    def _draw_scatter_perfnormal_figure(self, figsize=(11, 7)):
+    def _draw_scatter_perfnormal_figure(self, figsize=(11, 7), dias_recientes=30):
         """Un punto por día+máquina: cuánto se avanzó (Avance Turno) frente a cuántas horas
         de perforación efectiva (Horas Perforacion Normal, U14) tomó lograrlo, para ver de
-        un vistazo si una máquina rinde más o menos metros por hora que las demás. Devuelve
-        (fig, ax, {scatter_artist: maquina}) — reutilizado por PlotDash (interactivo, con
-        hover) y _render_scatter_perfnormal_png (estático para el reporte Word)."""
+        un vistazo si una máquina rinde más o menos metros por hora que las demás. Los
+        últimos `dias_recientes` días se resaltan (punto más grande, opaco y con borde)
+        sobre el resto (tenue) para ver de un vistazo si el rendimiento reciente mejoró o
+        empeoró frente al histórico. Devuelve (fig, ax, {scatter_artist: maquina}) —
+        reutilizado por PlotDash (interactivo, con hover) y _render_scatter_perfnormal_png
+        (estático para el reporte Word)."""
         self.df['Dia_dt'] = pd.to_datetime(self.df['Fecha']).dt.normalize()
         resumen_dia_maq = self.df.groupby(['Dia_dt', 'Maquina']).agg(
             Metros=('Avance Turno', 'sum'),
@@ -2750,6 +2788,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
             (resumen_dia_maq['Horas_Perf_Normal'] > 0) | (resumen_dia_maq['Metros'] > 0)
         ]
 
+        fecha_max = resumen_dia_maq['Dia_dt'].max()
+        fecha_corte = fecha_max - pd.Timedelta(days=dias_recientes - 1)
+        es_reciente = resumen_dia_maq['Dia_dt'] >= fecha_corte
+
         fig, ax = plt.subplots(figsize=figsize)
         maquinas_scatter = self._maquinas_validas(resumen_dia_maq)
         colores_scatter = plt.colormaps['Set1'](np.linspace(0, 1, len(maquinas_scatter)))
@@ -2758,19 +2800,40 @@ class MyApp(QMainWindow, Ui_MainWindow):
         scatters_maquina = {}
         for maquina in maquinas_scatter:
             datos_m = resumen_dia_maq[resumen_dia_maq['Maquina'] == maquina]
-            sc = ax.scatter(datos_m['Horas_Perf_Normal'], datos_m['Metros'],
-                             label=maquina, color=color_map_scatter[maquina],
-                             alpha=0.65, s=35, edgecolors='white', lw=0.4)
-            scatters_maquina[sc] = maquina
+            datos_viejos = datos_m[~es_reciente.loc[datos_m.index]]
+            datos_recientes = datos_m[es_reciente.loc[datos_m.index]]
+
+            if not datos_viejos.empty:
+                sc_v = ax.scatter(datos_viejos['Horas_Perf_Normal'], datos_viejos['Metros'],
+                                   label=maquina, color=color_map_scatter[maquina],
+                                   alpha=0.25, s=22, edgecolors='none', zorder=2)
+                scatters_maquina[sc_v] = maquina
+            if not datos_recientes.empty:
+                sc_r = ax.scatter(datos_recientes['Horas_Perf_Normal'], datos_recientes['Metros'],
+                                   label=maquina if datos_viejos.empty else None,
+                                   color=color_map_scatter[maquina],
+                                   alpha=0.9, s=55, edgecolors='black', lw=0.6, zorder=3)
+                scatters_maquina[sc_r] = maquina
 
         ax.set_title('Horas de Perforación Normal vs Metros Perforados (por día y máquina)',
                      fontweight='bold', fontsize=13)
         ax.set_xlabel('Horas Perforación Normal', fontweight='bold')
         ax.set_ylabel('Metros Perforados (Avance Turno)', fontweight='bold')
         ax.grid(True, linestyle=':', alpha=0.5)
-        ax.legend(title='Máquina', frameon=False, fontsize=9)
         for s in ['top', 'right']:
             ax.spines[s].set_visible(False)
+
+        leyenda_maquinas = ax.legend(title='Máquina', frameon=False, fontsize=9, loc='upper left')
+        ax.add_artist(leyenda_maquinas)
+        leyenda_periodo = [
+            Line2D([0], [0], marker='o', color='none', markerfacecolor='gray',
+                   markeredgecolor='black', markeredgewidth=0.6, markersize=8, alpha=0.9,
+                   label=f'Últimos {dias_recientes} días'),
+            Line2D([0], [0], marker='o', color='none', markerfacecolor='gray',
+                   markeredgecolor='none', markersize=6, alpha=0.3, label='Anterior'),
+        ]
+        ax.legend(handles=leyenda_periodo, title='Periodo', frameon=False, fontsize=9, loc='lower right')
+
         fig.tight_layout()
         return fig, ax, scatters_maquina
 
@@ -3234,20 +3297,12 @@ class MyApp(QMainWindow, Ui_MainWindow):
             if sub.empty:
                 continue
             ax.scatter(sub["ESTE_PLOT"], sub["NORTE_PLOT"], c=color, s=25, lw=0.5, zorder=4, label=estado)
-            if estado == "Perforando":
-                # Etiquetamos TODOS los sondajes en perforación (normalmente muy pocos a la vez).
-                # Cuando hay perforación paralela en la misma plataforma (mismas coordenadas de
-                # collar, p.ej. dos taladros desde EE-45), antes solo se mostraba la etiqueta del
-                # primero (coord_group == 0); ahora se muestran todas, separadas verticalmente y
-                # con el sondaje entre paréntesis para diferenciarlas.
-                sub = sub.copy()
-                sub['n_en_plataforma'] = sub.groupby(['ESTE', 'NORTE'])['Sondaje_fmt'].transform('count')
-                sub['idx_en_plataforma'] = sub.groupby(['ESTE', 'NORTE']).cumcount()
-                for _, r in sub.iterrows():
-                    texto = r['Plataforma'] if r['n_en_plataforma'] == 1 else f"{r['Plataforma']} ({r['Sondaje_fmt']})"
-                    offset_y = r['idx_en_plataforma'] * 25
-                    ax.text(r["ESTE"] - 12, r["NORTE"] + offset_y, texto, fontsize=6.5,
-                            ha='right', va='center', color='#333333', zorder=5, fontweight='bold')
+            if estado in ("Perforando", "Preinicio"):
+                # Etiquetamos TODOS los sondajes en Perforando/Preinicio (normalmente muy
+                # pocos a la vez), con plataforma + máquina (ver _etiquetar_puntos_plano);
+                # el resto de estados (Programado/Ejecutado/Plataforma) se dejan sin
+                # etiqueta para que el mapa siga siendo legible con decenas de puntos.
+                self._etiquetar_puntos_plano(ax, sub, fontsize=6.5)
 
         ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.13), ncol=5, title="Estado",
                   frameon=True, fontsize=8)
@@ -3348,6 +3403,14 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     row = tabla.add_row().cells
                     row[0].text = k
                     row[1].text = v
+
+                resumen_taladros = self._resumen_taladros()
+                if resumen_taladros is not None:
+                    perforados, planeados = resumen_taladros
+                    pct_taladros = (perforados / planeados * 100) if planeados > 0 else 0
+                    row = tabla.add_row().cells
+                    row[0].text = 'Taladros Perforados'
+                    row[1].text = f'{perforados} de {planeados} ({pct_taladros:.0f}%)'
 
                 doc.add_heading('Curva S — Plan vs Real', level=1)
                 doc.add_picture(img_curva, width=Inches(6.3))
