@@ -77,6 +77,100 @@ STANDBY_KEYWORDS = [
     "traslado de la maquina", "movilizacion", "reubicacion", "cambio de plataforma",
 ]
 
+# --- Parámetros del planificador de perforación (botones CarpetaPlan / GenerarPlan) ---
+PLAN_BUFFER_VIAS_M = 15  # Un punto a <= esta distancia de una vía la "cierra": solo 1 máquina a la vez en esa vía
+# Vias.dxf viene dibujado como cientos de flechas sueltas a ambos lados de la vía: las flechas a
+# <= PLAN_UNION_FLECHAS_M entre sí se agrupan en una misma vía (componente conectada), y dos
+# máquinas sobre la misma vía solo chocan si están a <= PLAN_TRAMO_VIA_M (cierran el mismo tramo).
+PLAN_UNION_FLECHAS_M = 25
+PLAN_TRAMO_VIA_M = 300
+PLAN_DIAS_INSTALACION = 1
+PLAN_DIAS_DESMOVILIZACION = 1
+PLAN_DIAS_RENDIMIENTO = 15  # Ventana (días hasta la fecha de corte) para el rendimiento de cada máquina
+# Progress (material volado) que NO se mina en el mes es una ventana de oportunidad: para elegir
+# el punto "más cercano" su distancia se multiplica por este factor (0.8 = se ve un 20% más cerca).
+PLAN_FACTOR_PROGRESS = 0.8
+# Status de la hoja DDH (sin tildes, minúsculas) que indican que la plataforma ya tiene máquina
+# o ya se perforó; si CUALQUIER fila de una plataforma (gemelos incluidos) tiene uno de estos,
+# esa plataforma no es un punto pendiente.
+PLAN_STATUS_OCUPADO = ("ejecutado", "perforando", "preinicio")
+PLAN_STATUS_DESCARTADO = ("anulad", "cancelad", "descartad", "suspendid")
+# "Plataforma" = plataforma construida esperando máquina: se considera pendiente aunque ya tenga DDHID.
+PLAN_STATUS_PENDIENTE_EXTRA = ("plataforma",)
+MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
+            "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+
+def _leer_geometrias_dxf(ruta_dxf):
+    """Lee un DXF y devuelve sus líneas en 2D (solo X, Y — los contornos de SEM/PERFO están a
+    medio banco y Vias en otro nivel que la topografía, así que la cota no se usa) como una
+    lista de dicts {'pts': ndarray Nx2, 'cerrada': bool, 'capa': str}. Se ignoran 3DFACE y
+    HATCH (en SEM/PERFO el HATCH repite el mismo contorno que la polilínea, y las 3DFACE son
+    la superficie de corte). Los bloques (INSERT, ej. flechas de las vías) se explotan."""
+    from ezdxf import path as ezdxf_path
+    doc = ezdxf.readfile(ruta_dxf)
+    geometrias = []
+
+    def procesar(entidad, profundidad=0):
+        tipo = entidad.dxftype()
+        if tipo == "INSERT" and profundidad < 3:
+            try:
+                for sub in entidad.virtual_entities():
+                    procesar(sub, profundidad + 1)
+            except Exception:
+                pass
+            return
+        if tipo not in ("LWPOLYLINE", "POLYLINE", "LINE", "ARC", "CIRCLE", "SPLINE", "ELLIPSE"):
+            return
+        if tipo == "POLYLINE" and entidad.get_mode() not in ("AcDb2dPolyline", "AcDb3dPolyline"):
+            return  # mallas / polyface
+        try:
+            pts = np.array([(v.x, v.y) for v in ezdxf_path.make_path(entidad).flattening(1)], dtype=float)
+        except Exception:
+            return
+        if len(pts) < 2:
+            return
+        if tipo == "LWPOLYLINE":
+            cerrada = bool(entidad.closed)
+        elif tipo == "POLYLINE":
+            cerrada = bool(entidad.is_closed)
+        elif tipo == "CIRCLE":
+            cerrada = True
+        else:
+            cerrada = False
+        cerrada = cerrada or (len(pts) >= 4 and np.hypot(*(pts[0] - pts[-1])) < 1e-6)
+        geometrias.append({'pts': pts, 'cerrada': cerrada, 'capa': entidad.dxf.get('layer', '')})
+
+    for entidad in doc.modelspace():
+        procesar(entidad)
+    return geometrias
+
+
+def _distancia_punto_polilinea(x, y, pts):
+    """Distancia mínima (en planta) del punto (x, y) a los segmentos de la polilínea `pts`."""
+    a, b = pts[:-1], pts[1:]
+    ab = b - a
+    largo2 = (ab ** 2).sum(axis=1)
+    largo2[largo2 == 0] = 1e-12
+    t = np.clip(((x - a[:, 0]) * ab[:, 0] + (y - a[:, 1]) * ab[:, 1]) / largo2, 0, 1)
+    proy = a + ab * t[:, None]
+    return float(np.min(np.hypot(proy[:, 0] - x, proy[:, 1] - y)))
+
+
+def _fecha_ddmm(ddmm, fecha_ref):
+    """Convierte 'ddmm' (de nombres como SEM01_2610-2810.dxf) en fecha, eligiendo el año
+    (anterior, actual o siguiente a fecha_ref) que deje la fecha más cerca de fecha_ref."""
+    dia, mes = int(ddmm[:2]), int(ddmm[2:])
+    candidatas = []
+    for anio in (fecha_ref.year - 1, fecha_ref.year, fecha_ref.year + 1):
+        try:
+            candidatas.append(pd.Timestamp(year=anio, month=mes, day=dia))
+        except ValueError:
+            continue
+    if not candidatas:
+        raise ValueError(f"'{ddmm}' no es una fecha ddmm válida")
+    return min(candidatas, key=lambda f: abs((f - fecha_ref).days))
+
 
 def _strip_accents(texto):
     return ''.join(c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c))
@@ -225,6 +319,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.Paradas.setEnabled(False)
         self.WordReport.setEnabled(False)
         self.PlotAlmacenBtn.setEnabled(False)
+        self.GenerarPlan.setEnabled(False)
         self.Reportes.clicked.connect(self.LoadReport)
         self.PlanPerf.clicked.connect(self.LoadPlan)
         self.CtrlProceso.clicked.connect(self.LoadProc)
@@ -241,6 +336,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.WordReport.clicked.connect(self.GenerateWordReport)
         self.FileAlmacen.clicked.connect(self.LoadAlmacen)
         self.PlotAlmacenBtn.clicked.connect(self.PlotAlmacen)
+        self.CarpetaPlan.clicked.connect(self.LoadCarpetaPlan)
+        self.GenerarPlan.clicked.connect(self.PlanificarPerforacion)
         self.Mensajes.setStyleSheet("color: blue; font-weight: bold;")
         self.errores_carga = []  # Errores detectados al leer los Excel de reportes (LoadReport)
         self.categorias_paradas_no_reconocidas = []  # Etiquetas de paradas sin categoría conocida
@@ -1803,6 +1900,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     QMessageBox.information(self, "Éxito", "Control de proceso (BD_Union) cargado y vinculado correctamente.")
                     self.Mensajes.setText("Se cargo el Archivo con el control de procesos \nrevisar que sea el actualizado")
                     self.PlanPerf.setEnabled(True)
+                    self.ruta_ctrl_proceso = file_path  # el planificador relee la hoja DDH (columnas C y W)
+                    self.GenerarPlan.setEnabled(hasattr(self, 'zonas_plan'))
 
     
                 except Exception as e:
@@ -4503,6 +4602,671 @@ class MyApp(QMainWindow, Ui_MainWindow):
         plt.close(fig)
         buf.seek(0)
         return buf
+
+    # ==================================================================================
+    # PLANIFICADOR DE PERFORACIÓN (botones CarpetaPlan / GenerarPlan)
+    # ==================================================================================
+    def _cargar_zonas_planificacion(self, carpeta, fecha_ref):
+        """Lee la carpeta de planificación y clasifica sus DXF por nombre:
+        - SEMxx_ddmm-ddmm: polígonos de minado de la semana xx; NO se perfora ahí entre esas fechas.
+        - PERFO_ddmm-ddmm: zona de perforación de producción de la semana; NO se ingresa entre esas fechas.
+        - Progress: material volado listo para minar; se puede perforar (y se prioriza si no está
+          en ningún SEM, es decir, si no se mina en el mes).
+        - Vias: tránsito de equipos pesados; se puede perforar pero solo UNA máquina a la vez por vía.
+        Los nombres se buscan dentro del nombre de archivo (no tienen que empezar exactamente así)
+        y el año de las fechas ddmm se infiere respecto a fecha_ref (fecha de corte)."""
+        from matplotlib.path import Path as MplPath
+        zonas = {'sem': [], 'perfo': [], 'progress': [], 'vias': [], 'avisos': [], 'archivos': []}
+        archivos = sorted(Path(carpeta).glob("*.[dD][xX][fF]"))
+        if not archivos:
+            zonas['avisos'].append("La carpeta no contiene archivos .dxf.")
+            return zonas
+
+        def poligonos_de(geometrias):
+            cerradas = [g['pts'] for g in geometrias if g['cerrada'] and len(g['pts']) >= 3]
+            if not cerradas:  # si nadie cerró los contornos, se usan igual las polilíneas de >= 3 vértices
+                cerradas = [g['pts'] for g in geometrias if len(g['pts']) >= 3]
+            return [{'pts': p, 'path': MplPath(p)} for p in cerradas]
+
+        for archivo in archivos:
+            nombre = archivo.stem
+            nombre_up = nombre.upper()
+            m_sem = re.search(r"SEM\s*_?\s*(\d+)\D*?(\d{4})\s*-\s*(\d{4})", nombre_up)
+            m_perfo = re.search(r"PERFO\D*?(\d{4})\s*-\s*(\d{4})", nombre_up)
+            tipo = ('sem' if m_sem else 'perfo' if m_perfo else
+                    'progress' if 'PROGRESS' in nombre_up else
+                    'vias' if re.search(r"V[IÍ]AS?\b", _strip_accents(nombre_up)) or 'VIA' in nombre_up else None)
+            if tipo is None:
+                zonas['avisos'].append(f"{archivo.name}: no se reconoce el tipo (SEM / PERFO / Progress / Vias), se omite.")
+                continue
+            try:
+                geometrias = _leer_geometrias_dxf(str(archivo))
+            except Exception as e:
+                zonas['avisos'].append(f"{archivo.name}: no se pudo leer el DXF ({e}).")
+                continue
+            if not geometrias:
+                zonas['avisos'].append(f"{archivo.name}: no tiene polilíneas/líneas utilizables.")
+                continue
+
+            if tipo in ('sem', 'perfo'):
+                grupos = m_sem.groups()[1:] if tipo == 'sem' else m_perfo.groups()
+                try:
+                    inicio = _fecha_ddmm(grupos[0], fecha_ref)
+                    fin = _fecha_ddmm(grupos[1], fecha_ref)
+                except ValueError as e:
+                    zonas['avisos'].append(f"{archivo.name}: fechas inválidas en el nombre ({e}), se omite.")
+                    continue
+                if fin < inicio:  # cruza de año (ej. 2812-0301)
+                    fin = fin.replace(year=fin.year + 1)
+                poligonos = poligonos_de(geometrias)
+                etiqueta = f"SEM{int(m_sem.group(1)):02d}" if tipo == 'sem' else "PERFO"
+                zonas[tipo].append({
+                    'nombre': etiqueta, 'archivo': archivo.name, 'inicio': inicio,
+                    'fin_excl': fin + pd.Timedelta(days=1), 'fin': fin, 'poligonos': poligonos,
+                })
+                detalle = f"{len(poligonos)} polígonos, {inicio:%d/%m/%Y} a {fin:%d/%m/%Y}"
+            elif tipo == 'progress':
+                zonas['progress'].extend(poligonos_de(geometrias))
+                detalle = f"{len(zonas['progress'])} polígonos"
+            else:
+                zonas['vias'].extend({'pts': g['pts'], 'bbox': (*g['pts'].min(axis=0), *g['pts'].max(axis=0))}
+                                     for g in geometrias)
+                detalle = f"{len(geometrias)} líneas/flechas de vía"
+            zonas['archivos'].append({'Archivo': archivo.name, 'Tipo': tipo.upper(), 'Detalle': detalle})
+
+        if zonas['vias']:
+            self._agrupar_vias(zonas['vias'])
+        else:
+            zonas['avisos'].append("No se encontró Vias.dxf: el plan NO considera la restricción de "
+                                   "una máquina por vía.")
+        return zonas
+
+    @staticmethod
+    def _agrupar_vias(vias):
+        """Asigna a cada línea/flecha de Vias.dxf el id de la vía a la que pertenece ('V1', 'V2', ...):
+        las flechas cuyos vértices quedan a <= PLAN_UNION_FLECHAS_M se unen (union-find), así los
+        dos bordes y todas las flechas de un mismo camino forman una sola vía."""
+        from scipy.spatial import cKDTree
+        vertices = np.vstack([v['pts'] for v in vias])
+        dueno = np.concatenate([np.full(len(v['pts']), i) for i, v in enumerate(vias)])
+        padre = list(range(len(vias)))
+
+        def raiz(i):
+            while padre[i] != i:
+                padre[i] = padre[padre[i]]
+                i = padre[i]
+            return i
+
+        for a, b in cKDTree(vertices).query_pairs(PLAN_UNION_FLECHAS_M):
+            ra, rb = raiz(dueno[a]), raiz(dueno[b])
+            if ra != rb:
+                padre[ra] = rb
+        ids = {}
+        for i, via in enumerate(vias):
+            via['id'] = ids.setdefault(raiz(i), f"V{len(ids) + 1}")
+
+    def _restricciones_punto(self, x, y, zonas):
+        """Restricciones espaciales de un punto: ventanas de fecha en que NO se puede ocupar
+        (SEM / PERFO que lo contienen), vías que cierra (a <= PLAN_BUFFER_VIAS_M) y si cae en
+        Progress / en algún SEM (para la prioridad de Progress no minado en el mes)."""
+        bloqueos, etiquetas = [], []
+        en_sem = False
+        for tipo in ('sem', 'perfo'):
+            for zona in zonas[tipo]:
+                if any(p['path'].contains_point((x, y)) for p in zona['poligonos']):
+                    motivo = f"{zona['nombre']} ({zona['inicio']:%d/%m}-{zona['fin']:%d/%m})"
+                    bloqueos.append((zona['inicio'], zona['fin_excl'], motivo))
+                    etiquetas.append(motivo)
+                    en_sem = en_sem or tipo == 'sem'
+        vias = []
+        b = PLAN_BUFFER_VIAS_M
+        for via in zonas['vias']:
+            x0, y0, x1, y1 = via['bbox']
+            if via['id'] in vias or not (x0 - b <= x <= x1 + b and y0 - b <= y <= y1 + b):
+                continue
+            if _distancia_punto_polilinea(x, y, via['pts']) <= b:
+                vias.append(via['id'])
+        vias = sorted(vias, key=lambda v: int(v[1:]))
+        if vias:
+            etiquetas.append("Vía " + ", ".join(vias))
+        en_progress = any(p['path'].contains_point((x, y)) for p in zonas['progress'])
+        if en_progress:
+            etiquetas.append("Progress" + ("" if en_sem else " (no se mina en el mes)"))
+        return {'bloqueos': bloqueos, 'vias': vias, 'en_progress': en_progress,
+                'en_sem': en_sem, 'zona': "; ".join(etiquetas) if etiquetas else "Libre"}
+
+    def _leer_ddh_planificacion(self):
+        """Relee la hoja DDH del Control de Proceso con las columnas que necesita el planificador
+        (A Identificador, B Plataforma, C DDHID, F-I coordenadas/LENGTH, V Status, W Maquina) y
+        devuelve (pendientes, compromisos, sin_coordenadas, avisos):
+        - pendientes: una fila por PLATAFORMA (los gemelos cuentan una vez) con valor en B y sin
+          DDHID (C) o sin Status (V) — más las de Status "Plataforma" (construida, esperando
+          máquina) y las "Preinicio" que aún no tienen máquina. Una plataforma que en cualquiera
+          de sus filas ya está Ejecutada / Perforando / Preinicio con máquina no es pendiente.
+        - compromisos: lo que cada máquina tiene en curso (Perforando) o ya asignado (Preinicio);
+          determina dónde está cada máquina y cuándo se libera."""
+        avisos = []
+        ruta = self.ruta_ctrl_proceso
+        columnas = ['Identificador', 'Plataforma', 'DDHID', 'ESTE', 'NORTE', 'ELEV', 'LENGTH', 'Status', 'Maquina_DDH']
+        try:
+            ddh = pd.read_excel(ruta, sheet_name="DDH", header=1, usecols="A,B,C,F,G,H,I,V,W")
+            ddh.columns = columnas
+        except Exception:
+            ddh = pd.read_excel(ruta, sheet_name="DDH", header=1, usecols="A,B,C,F,G,H,I,V")
+            ddh.columns = columnas[:-1]
+            ddh['Maquina_DDH'] = np.nan
+            avisos.append("La hoja DDH no tiene columna W (Maquina): la máquina se toma de los reportes de turno.")
+
+        for col in ('Identificador', 'Plataforma', 'DDHID', 'Status', 'Maquina_DDH'):
+            ddh[col] = ddh[col].fillna("").astype(str).str.strip().replace({"nan": "", "NaN": ""})
+        for col in ('ESTE', 'NORTE', 'ELEV', 'LENGTH'):
+            ddh[col] = pd.to_numeric(ddh[col], errors='coerce')
+        ddh = ddh[ddh['Plataforma'] != ""].copy()
+        ddh['Status_norm'] = ddh['Status'].map(lambda s: _strip_accents(s).lower())
+        ddh['Plat_key'] = ddh['Plataforma'].str.upper().str.replace(r"\s+", "", regex=True)
+
+        # Máquina de respaldo: la que reporta ese sondaje en los reportes de turno (BD_Union_total)
+        maquina_reportes = {}
+        if hasattr(self, 'BD_Union_total') and {'Identificador', 'Maquina'} <= set(self.BD_Union_total.columns):
+            fuente = self.BD_Union_total.dropna(subset=['Maquina'])
+            maquina_reportes = dict(zip(fuente['Identificador'].astype(str).str.strip(), fuente['Maquina'].astype(str)))
+        faltante_reportes = {}
+        if hasattr(self, 'BD_Union_total') and {'Identificador', 'Metro_Faltante'} <= set(self.BD_Union_total.columns):
+            fuente = self.BD_Union_total.dropna(subset=['Metro_Faltante'])
+            faltante_reportes = dict(zip(fuente['Identificador'].astype(str).str.strip(), fuente['Metro_Faltante']))
+
+        ddh['Maquina'] = ddh['Maquina_DDH']
+        sin_maquina = ddh['Maquina'] == ""
+        ddh.loc[sin_maquina, 'Maquina'] = ddh.loc[sin_maquina, 'Identificador'].map(maquina_reportes).fillna("")
+
+        activos = ddh[ddh['Status_norm'].isin(("perforando", "preinicio"))]
+        compromisos = activos[activos['Maquina'] != ""].copy()
+        for _, r in activos[(activos['Maquina'] == "") & (activos['Status_norm'] == "perforando")].iterrows():
+            avisos.append(f"Plataforma {r['Plataforma']} ({r['Identificador']}) está Perforando pero sin máquina "
+                          f"(columna W vacía y sin reportes): no se usa como posición de ninguna máquina.")
+        compromisos['Metro_Faltante'] = compromisos.apply(
+            lambda r: faltante_reportes.get(r['Identificador'], r['LENGTH']) if r['Status_norm'] == "perforando" else r['LENGTH'],
+            axis=1)
+
+        ocupadas = set(ddh.loc[ddh['Status_norm'] == "ejecutado", 'Plat_key'])
+        ocupadas |= set(ddh.loc[ddh['Status_norm'] == "perforando", 'Plat_key'])
+        ocupadas |= set(compromisos['Plat_key'])
+        descartada = ddh['Status_norm'].map(lambda s: any(s.startswith(p) for p in PLAN_STATUS_DESCARTADO))
+        es_candidata = ((ddh['DDHID'] == "") | (ddh['Status'] == "")
+                        | ddh['Status_norm'].isin(PLAN_STATUS_PENDIENTE_EXTRA + ("preinicio",)))
+        candidatas = ddh[es_candidata & ~descartada & ~ddh['Plat_key'].isin(ocupadas)]
+
+        filas = []
+        for _, grupo in candidatas.groupby('Plat_key', sort=False):
+            con_coord = grupo.dropna(subset=['ESTE', 'NORTE'])
+            base = con_coord.iloc[0] if not con_coord.empty else grupo.iloc[0]
+            filas.append({
+                'Plataforma': base['Plataforma'],
+                'Identificador': ", ".join(i for i in grupo['Identificador'].unique() if i),
+                'Status': base['Status'] or "Programado",
+                'ESTE': base['ESTE'], 'NORTE': base['NORTE'], 'ELEV': base['ELEV'],
+                'LENGTH': grupo['LENGTH'].max(),
+            })
+        pendientes = pd.DataFrame(filas, columns=['Plataforma', 'Identificador', 'Status', 'ESTE', 'NORTE', 'ELEV', 'LENGTH'])
+        sin_coordenadas = pendientes[pendientes[['ESTE', 'NORTE']].isna().any(axis=1)].copy()
+        pendientes = pendientes.drop(sin_coordenadas.index).reset_index(drop=True)
+        if not sin_coordenadas.empty:
+            avisos.append(f"{len(sin_coordenadas)} plataformas pendientes sin coordenadas ESTE/NORTE no se planifican "
+                          f"(ver hoja Sin_Coordenadas).")
+        pendientes['LENGTH_estimado'] = pendientes['LENGTH'].isna() | (pendientes['LENGTH'] <= 0)
+        if pendientes['LENGTH_estimado'].any():
+            mediana = pendientes.loc[~pendientes['LENGTH_estimado'], 'LENGTH'].median()
+            mediana = mediana if pd.notna(mediana) else 300.0
+            pendientes.loc[pendientes['LENGTH_estimado'], 'LENGTH'] = mediana
+            avisos.append(f"{int(pendientes['LENGTH_estimado'].sum())} plataformas sin LENGTH: se asumió {mediana:.0f} m (mediana).")
+        return pendientes, compromisos.reset_index(drop=True), sin_coordenadas, avisos
+
+    def _rendimiento_maquinas(self, dias=PLAN_DIAS_RENDIMIENTO):
+        """Rendimiento de cada máquina en m/día = metros perforados en los últimos `dias` días
+        hasta la fecha de corte (última fecha de los reportes) / días que reportó en esa ventana.
+        Sin avance en la ventana -> su promedio histórico; sin historia -> mediana de las demás.
+        Devuelve (DataFrame, fecha_corte)."""
+        df = self.df[['Fecha', 'Maquina', 'Avance Turno']].copy()
+        df['Fecha'] = pd.to_datetime(df['Fecha'], errors='coerce').dt.normalize()
+        df['Avance Turno'] = pd.to_numeric(df['Avance Turno'], errors='coerce').fillna(0)
+        df = df.dropna(subset=['Fecha'])
+        df = df[df['Maquina'].isin(self._maquinas_validas(df))]
+        corte = df['Fecha'].max()
+        desde = corte - pd.Timedelta(days=dias - 1)
+        filas = []
+        for maquina, grupo in df.groupby('Maquina'):
+            ventana = grupo[grupo['Fecha'] >= desde]
+            metros, dias_rep = ventana['Avance Turno'].sum(), ventana['Fecha'].nunique()
+            if dias_rep > 0 and metros > 0:
+                rate, fuente = metros / dias_rep, f"Últimos {dias} días"
+            else:
+                diario = grupo.groupby('Fecha')['Avance Turno'].sum()
+                rate = diario.mean() if len(diario) and diario.sum() > 0 else np.nan
+                fuente = "Promedio histórico (sin avance reciente)"
+            filas.append({'Maquina': str(maquina), f'Metros_{dias}d': round(metros, 1), 'Dias_Reportados': dias_rep,
+                          'Rendimiento_m_dia': rate, 'Fuente': fuente})
+        rend = pd.DataFrame(filas)
+        if not rend.empty:
+            mediana = rend['Rendimiento_m_dia'].median()
+            mediana = mediana if pd.notna(mediana) else OBJETIVO_DIARIO_M
+            sin_dato = rend['Rendimiento_m_dia'].isna()
+            rend.loc[sin_dato, 'Rendimiento_m_dia'] = mediana
+            rend.loc[sin_dato, 'Fuente'] = "Mediana de las demás máquinas"
+            rend['Rendimiento_m_dia'] = rend['Rendimiento_m_dia'].round(1)
+        return rend, corte
+
+    @staticmethod
+    def _primer_inicio_factible(t, duracion, bloqueos, vias, ocupacion_vias, x, y):
+        """Primera fecha >= t en que el punto (x, y) puede ocuparse `duracion` sin cruzarse con
+        una ventana SEM/PERFO que lo contiene ni con otra máquina sobre la misma vía a
+        <= PLAN_TRAMO_VIA_M (mismo tramo cerrado). Devuelve (fecha, motivo de la última espera o "")."""
+        s, motivo = t, ""
+        for _ in range(10000):
+            conflicto = None
+            for ini, fin, mot in bloqueos:
+                if s < fin and s + duracion > ini:
+                    conflicto = (fin, mot)
+                    break
+            if conflicto is None:
+                for via in vias:
+                    for ini, fin, maq, xo, yo in ocupacion_vias.get(via, []):
+                        if s < fin and s + duracion > ini and np.hypot(x - xo, y - yo) <= PLAN_TRAMO_VIA_M:
+                            conflicto = (fin, f"Vía {via} ocupada por {maq}")
+                            break
+                    if conflicto:
+                        break
+            if conflicto is None:
+                return s, motivo
+            s, motivo = conflicto
+        return s, motivo
+
+    def _planificar_perforacion(self, pendientes, compromisos, rendimiento, zonas, corte):
+        """Asignación voraz por eventos hasta perforar todos los puntos pendientes:
+        la máquina que se libera primero (empate: la de mejor rendimiento) toma el punto libre
+        más cercano a su posición (Progress no minado en el mes se ve PLAN_FACTOR_PROGRESS más
+        cerca) que pueda ocupar sin esperar; si ninguno está libre ya, el que antes se libere.
+        Días por punto = instalación + ceil(LENGTH / rendimiento) + desmovilización.
+        Devuelve (plan, estado_compromisos, avisos)."""
+        avisos = []
+        inicio_plan = corte + pd.Timedelta(days=1)
+        rend_por_maquina = dict(zip(rendimiento['Maquina'], rendimiento['Rendimiento_m_dia']))
+        rate_defecto = rendimiento['Rendimiento_m_dia'].median() if not rendimiento.empty else OBJETIVO_DIARIO_M
+        equivalencias = self._emparejar_nombres_maquina(sorted(compromisos['Maquina'].unique()), list(rend_por_maquina))
+
+        def rate_de(maquina):
+            nombre = equivalencias.get(maquina)
+            if nombre is None:
+                avisos.append(f"Máquina '{maquina}' (columna W) sin reportes de turno: se usa rendimiento mediano {rate_defecto:.1f} m/día.")
+                return float(rate_defecto)
+            return float(rend_por_maquina[nombre])
+
+        # 1) Estado inicial de cada máquina: termina lo que tiene en curso (Perforando) y lo ya
+        #    asignado (Preinicio); ahí queda su posición y su fecha de liberación.
+        ocupacion_vias = {}
+        maquinas, filas_comp = {}, []
+        orden_estado = {"perforando": 0, "preinicio": 1}
+        compromisos = compromisos.assign(_orden=compromisos['Status_norm'].map(orden_estado)).sort_values(['Maquina', '_orden'])
+        for maquina, grupo in compromisos.groupby('Maquina', sort=False):
+            rate = rate_de(maquina)
+            t, pos, plataforma = inicio_plan, None, ""
+            for _, r in grupo.iterrows():
+                metros = r['Metro_Faltante'] if pd.notna(r['Metro_Faltante']) else 0.0
+                dias_perf = int(np.ceil(metros / rate)) if metros > 0 else 0
+                dias = dias_perf + PLAN_DIAS_DESMOVILIZACION + (PLAN_DIAS_INSTALACION if r['Status_norm'] == "preinicio" else 0)
+                fin = t + pd.Timedelta(days=dias)
+                if pd.notna(r['ESTE']) and pd.notna(r['NORTE']):
+                    pos, plataforma = (float(r['ESTE']), float(r['NORTE'])), r['Plataforma']
+                    for via in self._restricciones_punto(pos[0], pos[1], zonas)['vias']:
+                        ocupacion_vias.setdefault(via, []).append((t, fin, maquina, pos[0], pos[1]))
+                filas_comp.append({'Maquina': maquina, 'Plataforma': r['Plataforma'], 'Identificador': r['Identificador'],
+                                   'Estado': r['Status'], 'ESTE': r['ESTE'], 'NORTE': r['NORTE'],
+                                   'Metros_Faltantes': round(float(metros), 1), 'Rendimiento_m_dia': rate,
+                                   'Dias_Restantes': dias, 'Fecha_Liberacion': fin.date()})
+                t = fin
+            maquinas[maquina] = {'t_libre': t, 'pos': pos, 'plataforma': plataforma, 'rate': rate}
+        estado_compromisos = pd.DataFrame(filas_comp)
+        if not maquinas:
+            avisos.append("No hay máquinas en Perforando/Preinicio con nombre (columna W): no se puede planificar.")
+            return pd.DataFrame(), estado_compromisos, avisos
+
+        centro = (pendientes['ESTE'].mean(), pendientes['NORTE'].mean()) if not pendientes.empty else (0.0, 0.0)
+        for datos in maquinas.values():
+            if datos['pos'] is None:
+                datos['pos'], datos['plataforma'] = centro, "(sin coordenadas)"
+
+        restricciones = [self._restricciones_punto(r['ESTE'], r['NORTE'], zonas) for _, r in pendientes.iterrows()]
+        libres = set(range(len(pendientes)))
+        filas = []
+        while libres:
+            maquina = min(maquinas, key=lambda m: (maquinas[m]['t_libre'], -maquinas[m]['rate']))
+            datos = maquinas[maquina]
+            mejor = None
+            for i in libres:
+                p = pendientes.iloc[i]
+                dias_perf = float(p['LENGTH']) / datos['rate']
+                duracion = pd.Timedelta(days=PLAN_DIAS_INSTALACION + int(np.ceil(dias_perf)) + PLAN_DIAS_DESMOVILIZACION)
+                rest = restricciones[i]
+                inicio, motivo = self._primer_inicio_factible(datos['t_libre'], duracion, rest['bloqueos'],
+                                                              rest['vias'], ocupacion_vias, p['ESTE'], p['NORTE'])
+                distancia = float(np.hypot(p['ESTE'] - datos['pos'][0], p['NORTE'] - datos['pos'][1]))
+                costo = distancia * (PLAN_FACTOR_PROGRESS if rest['en_progress'] and not rest['en_sem'] else 1.0)
+                clave = (inicio > datos['t_libre'], inicio if inicio > datos['t_libre'] else pd.Timestamp.min, costo)
+                if mejor is None or clave < mejor[0]:
+                    mejor = (clave, i, inicio, motivo, duracion, dias_perf, distancia)
+            _, i, inicio, motivo, duracion, dias_perf, distancia = mejor
+            p, rest = pendientes.iloc[i], restricciones[i]
+            fin = inicio + duracion
+            for via in rest['vias']:
+                ocupacion_vias.setdefault(via, []).append((inicio, fin, maquina, float(p['ESTE']), float(p['NORTE'])))
+            espera = (inicio - datos['t_libre']).days
+            filas.append({
+                'Maquina': maquina, 'Plataforma': p['Plataforma'], 'Identificador': p['Identificador'],
+                'Status_DDH': p['Status'], 'ESTE': p['ESTE'], 'NORTE': p['NORTE'], 'ELEV': p['ELEV'],
+                'LENGTH_m': round(float(p['LENGTH']), 1), 'LENGTH_estimado': bool(p['LENGTH_estimado']),
+                'Rendimiento_m_dia': datos['rate'], 'Desde_Plataforma': datos['plataforma'],
+                'Desde_ESTE': datos['pos'][0], 'Desde_NORTE': datos['pos'][1], 'Distancia_m': round(distancia, 1),
+                'Dias_Instalacion': PLAN_DIAS_INSTALACION, 'Dias_Perforacion': round(dias_perf, 1),
+                'Dias_Desmovilizacion': PLAN_DIAS_DESMOVILIZACION, 'Dias_Totales': duracion.days,
+                'Fecha_Inicio': inicio, 'Fecha_Fin': fin - pd.Timedelta(days=1),
+                'Espera_dias': espera, 'Motivo_Espera': motivo if espera > 0 else "",
+                'Zona': rest['zona'],
+            })
+            datos.update({'t_libre': fin, 'pos': (float(p['ESTE']), float(p['NORTE'])), 'plataforma': p['Plataforma']})
+            libres.discard(i)
+
+        plan = pd.DataFrame(filas).sort_values(['Fecha_Inicio', 'Maquina']).reset_index(drop=True)
+        plan.insert(0, 'N', np.arange(1, len(plan) + 1))
+        plan['Secuencia_Maquina'] = plan.groupby('Maquina').cumcount() + 1
+        # Mes operativo del proyecto (20 -> 19, ver _mes_personalizado), igual que el resto de reportes.
+        periodo = plan['Fecha_Inicio'].map(self._mes_personalizado)
+        indice_mes = periodo.map(lambda p: p.ordinal) - periodo.min().ordinal
+        plan.insert(1, 'Mes', periodo.map(lambda p: f"{MESES_ES[p.month - 1]} {p.year}"))
+        plan.insert(2, 'Horizonte', np.select([indice_mes <= 0, indice_mes <= 2], ["Mes 1", "Meses 2-3"], "Posterior"))
+        return plan, estado_compromisos, avisos
+
+    def _dibujar_plan_perforacion(self, ax, plan, compromisos, zonas, fontsize=7):
+        """Dibuja el plan: topografía, zonas (Progress, SEM, PERFO, Vías), contexto de sondajes
+        ejecutados, posición actual de cada máquina, puntos numerados (N°, máquina, días) y
+        flechas con la secuencia de movimientos de cada máquina. Devuelve un dict
+        mes -> lista de artistas, para poder filtrar por mes en la vista interactiva."""
+        from matplotlib.patches import Patch
+        self._dibujar_topografia(ax)
+        handles = []
+        for poligono in zonas['progress']:
+            ax.fill(poligono['pts'][:, 0], poligono['pts'][:, 1], facecolor='#D9B38C', alpha=0.25,
+                    edgecolor='#A0522D', lw=0.5, zorder=1.5)
+        if zonas['progress']:
+            handles.append(Patch(facecolor='#D9B38C', alpha=0.5, edgecolor='#A0522D', label='Progress (volado)'))
+        colores_sem = plt.cm.tab10.colors
+        for k, sem in enumerate(sorted(zonas['sem'], key=lambda z: z['inicio'])):
+            color = colores_sem[k % len(colores_sem)]
+            for poligono in sem['poligonos']:
+                ax.fill(poligono['pts'][:, 0], poligono['pts'][:, 1], facecolor=color, alpha=0.28,
+                        edgecolor=color, lw=0.7, zorder=1.6)
+            handles.append(Patch(facecolor=color, alpha=0.4, edgecolor=color,
+                                 label=f"{sem['nombre']} minado {sem['inicio']:%d/%m}-{sem['fin']:%d/%m}"))
+        for perfo in zonas['perfo']:
+            for poligono in perfo['poligonos']:
+                ax.fill(poligono['pts'][:, 0], poligono['pts'][:, 1], facecolor='none', edgecolor='#C00000',
+                        hatch='///', lw=0.9, zorder=1.7)
+            handles.append(Patch(facecolor='none', edgecolor='#C00000', hatch='///',
+                                 label=f"PERFO {perfo['inicio']:%d/%m}-{perfo['fin']:%d/%m}"))
+        if zonas['vias']:
+            from matplotlib.collections import LineCollection
+            ax.add_collection(LineCollection([via['pts'] for via in zonas['vias']], colors='#1F5FBF', lw=0.9, zorder=1.8))
+        if zonas['vias']:
+            handles.append(Line2D([], [], color='#1F5FBF', lw=1.5, label=f'Vías (1 máquina por tramo de {PLAN_TRAMO_VIA_M} m)'))
+
+        if hasattr(self, 'BD_Union_total') and 'Estado' in self.BD_Union_total.columns:
+            ejecutados = self.BD_Union_total[self.BD_Union_total['Estado'] == 'Ejecutado'].dropna(subset=['ESTE', 'NORTE'])
+            ax.scatter(ejecutados['ESTE'], ejecutados['NORTE'], s=10, c='#7FBF7F', zorder=2)
+            handles.append(Line2D([], [], marker='o', ls='', color='#7FBF7F', label='Ejecutado'))
+
+        nombres = sorted(set(plan['Maquina']) | set(compromisos['Maquina'] if not compromisos.empty else []))
+        colores = self._color_map_por_categoria(nombres, saturacion=0.8, brillo=0.8)
+        if not compromisos.empty:
+            actuales = compromisos.dropna(subset=['ESTE', 'NORTE']).groupby('Maquina').last()
+            for maquina, r in actuales.iterrows():
+                ax.scatter(r['ESTE'], r['NORTE'], marker='s', s=110, color=colores[maquina],
+                           edgecolor='black', lw=1.2, zorder=6)
+                ax.text(r['ESTE'], r['NORTE'] - 22, f"{maquina}\n{r['Plataforma']} (libre {r['Fecha_Liberacion']:%d/%m})",
+                        fontsize=fontsize, ha='center', va='top', fontweight='bold', zorder=7,
+                        bbox=dict(boxstyle='round,pad=0.2', fc='white', ec=colores[maquina], alpha=0.85))
+            handles.append(Line2D([], [], marker='s', ls='', color='gray', mec='black', label='Posición actual máquina'))
+
+        artistas_por_mes = {}
+        for maquina in nombres:
+            handles.append(Line2D([], [], color=colores[maquina], lw=2, marker='o', label=maquina))
+        for _, r in plan.iterrows():
+            color = colores[r['Maquina']]
+            artistas = artistas_por_mes.setdefault(r['Mes'], [])
+            artistas.append(ax.annotate("", xy=(r['ESTE'], r['NORTE']), xytext=(r['Desde_ESTE'], r['Desde_NORTE']),
+                                        arrowprops=dict(arrowstyle='-|>', color=color, lw=1.4, shrinkA=7, shrinkB=9,
+                                                        mutation_scale=12), zorder=3))
+            artistas.append(ax.scatter(r['ESTE'], r['NORTE'], s=170, color=color, edgecolor='black', lw=0.8, zorder=4))
+            artistas.append(ax.text(r['ESTE'], r['NORTE'], str(r['N']), fontsize=fontsize, ha='center', va='center',
+                                    color='white', fontweight='bold', zorder=5))
+            # Etiqueta corta (las plataformas están a ~60 m): el color ya indica la máquina y las
+            # fechas van en el Excel / en el hover de la vista interactiva.
+            artistas.append(ax.text(r['ESTE'] + 13, r['NORTE'] + 6, f"{r['Plataforma']} · {r['Dias_Totales']} d",
+                                    fontsize=fontsize - 1, ha='left', va='bottom', color='#222222', zorder=5, clip_on=True))
+
+        xs = list(plan['ESTE']) + list(plan['Desde_ESTE'])
+        ys = list(plan['NORTE']) + list(plan['Desde_NORTE'])
+        if xs:
+            margen = max(np.ptp(xs), np.ptp(ys)) * 0.08 + 80
+            ax.set_xlim(min(xs) - margen, max(xs) + margen)
+            ax.set_ylim(min(ys) - margen, max(ys) + margen)
+        ax.set_aspect('equal', adjustable='box')
+        ax.ticklabel_format(useOffset=False, style='plain')
+        ax.set_xlabel('ESTE (m)')
+        ax.set_ylabel('NORTE (m)')
+        ax.grid(True, ls=':', alpha=0.4)
+        ax.legend(handles=handles, loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=8, frameon=False)
+        return artistas_por_mes
+
+    def _render_plan_png(self, plan, compromisos, zonas, ruta_png):
+        fig, ax = plt.subplots(figsize=(18, 12))
+        self._dibujar_plan_perforacion(ax, plan, compromisos, zonas, fontsize=7)
+        ax.set_title(f"Plan de Perforación — {plan['Fecha_Inicio'].min():%d/%m/%Y} a {plan['Fecha_Fin'].max():%d/%m/%Y}",
+                     fontweight='bold', fontsize=14)
+        fig.savefig(ruta_png, dpi=140, bbox_inches='tight')
+        plt.close(fig)
+
+    def _exportar_plan_excel(self, ruta, plan, compromisos, rendimiento, sin_coordenadas, zonas, avisos, ruta_png=None):
+        """Excel del plan: Plan_Completo, una hoja por mes, resúmenes por mes y por máquina,
+        compromisos actuales, rendimiento de 15 días, zonas cargadas, observaciones y el ploteo."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        columnas = ['N', 'Mes', 'Horizonte', 'Maquina', 'Secuencia_Maquina', 'Plataforma', 'Identificador', 'Status_DDH',
+                    'ESTE', 'NORTE', 'ELEV', 'LENGTH_m', 'Rendimiento_m_dia', 'Desde_Plataforma', 'Distancia_m',
+                    'Dias_Instalacion', 'Dias_Perforacion', 'Dias_Desmovilizacion', 'Dias_Totales',
+                    'Fecha_Inicio', 'Fecha_Fin', 'Espera_dias', 'Motivo_Espera', 'Zona', 'LENGTH_estimado']
+        tabla = plan[columnas].copy()
+        tabla['Fecha_Inicio'] = tabla['Fecha_Inicio'].dt.date
+        tabla['Fecha_Fin'] = tabla['Fecha_Fin'].dt.date
+
+        resumen_mes = (plan.groupby(['Mes', 'Horizonte'], sort=False)
+                       .agg(Puntos=('N', 'count'), Metros=('LENGTH_m', 'sum'), Maquinas=('Maquina', 'nunique'),
+                            Dias_Maquina=('Dias_Totales', 'sum'), Desde=('Fecha_Inicio', 'min'), Hasta=('Fecha_Fin', 'max'))
+                       .reset_index())
+        resumen_mes['Puntos_Acumulados'] = resumen_mes['Puntos'].cumsum()
+        resumen_mes['Desde'] = resumen_mes['Desde'].dt.date
+        resumen_mes['Hasta'] = resumen_mes['Hasta'].dt.date
+        resumen_maquina = (plan.groupby('Maquina')
+                           .agg(Puntos=('N', 'count'), Metros=('LENGTH_m', 'sum'), Rendimiento_m_dia=('Rendimiento_m_dia', 'first'),
+                                Distancia_Total_m=('Distancia_m', 'sum'), Dias_Totales=('Dias_Totales', 'sum'),
+                                Dias_Espera=('Espera_dias', 'sum'), Inicio=('Fecha_Inicio', 'min'), Termina=('Fecha_Fin', 'max'))
+                           .reset_index())
+        resumen_maquina['Inicio'] = resumen_maquina['Inicio'].dt.date
+        resumen_maquina['Termina'] = resumen_maquina['Termina'].dt.date
+        observaciones = pd.DataFrame({'Observacion': avisos + zonas['avisos'] + [
+            f"Días por punto = {PLAN_DIAS_INSTALACION} instalación + ceil(LENGTH / rendimiento) + {PLAN_DIAS_DESMOVILIZACION} desmovilización.",
+            f"Rendimiento = metros de los últimos {PLAN_DIAS_RENDIMIENTO} días / días reportados en esa ventana.",
+            "Mes = mes operativo del proyecto (del día 20 al 19; Diciembre hasta el 31), según la fecha de inicio del punto.",
+            "SEM / PERFO bloquean el punto solo entre sus fechas; fuera de ellas solo aplica la restricción de vías.",
+            f"Puntos a <= {PLAN_BUFFER_VIAS_M} m de una vía la cierran: no puede haber otra máquina en la misma vía "
+            f"a <= {PLAN_TRAMO_VIA_M} m al mismo tiempo.",
+            f"Progress no minado en el mes se prioriza (distancia x {PLAN_FACTOR_PROGRESS}).",
+        ]})
+
+        with pd.ExcelWriter(ruta, engine='openpyxl') as writer:
+            tabla.to_excel(writer, sheet_name='Plan_Completo', index=False)
+            for mes in plan['Mes'].unique():
+                tabla[tabla['Mes'] == mes].to_excel(writer, sheet_name=mes[:31], index=False)
+            resumen_mes.to_excel(writer, sheet_name='Resumen_Mensual', index=False)
+            resumen_maquina.to_excel(writer, sheet_name='Resumen_Maquina', index=False)
+            compromisos.to_excel(writer, sheet_name='Compromisos_Actuales', index=False)
+            rendimiento.to_excel(writer, sheet_name=f'Rendimiento_{PLAN_DIAS_RENDIMIENTO}d', index=False)
+            pd.DataFrame(zonas['archivos'], columns=['Archivo', 'Tipo', 'Detalle']).to_excel(writer, sheet_name='Zonas_Cargadas', index=False)
+            if not sin_coordenadas.empty:
+                sin_coordenadas.to_excel(writer, sheet_name='Sin_Coordenadas', index=False)
+            observaciones.to_excel(writer, sheet_name='Observaciones', index=False)
+
+            encabezado = PatternFill('solid', fgColor='1F4E78')
+            for hoja in writer.book.worksheets:
+                for celda in hoja[1]:
+                    celda.font = Font(bold=True, color='FFFFFF')
+                    celda.fill = encabezado
+                    celda.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                for fila in hoja.iter_rows(min_row=2):
+                    for celda in fila:
+                        if isinstance(celda.value, (datetime, pd.Timestamp)) or type(celda.value).__name__ == 'date':
+                            celda.number_format = 'DD/MM/YYYY'
+                for columna in hoja.columns:
+                    largo = max(len(str(c.value)) if c.value is not None else 0 for c in columna)
+                    largo = min(largo, 12) if columna[1:] and hoja.cell(2, columna[0].column).number_format == 'DD/MM/YYYY' else largo
+                    hoja.column_dimensions[columna[0].column_letter].width = min(max(10, largo + 2), 60)
+                hoja.freeze_panes = 'A2'
+            if ruta_png and os.path.exists(ruta_png):
+                try:
+                    from openpyxl.drawing.image import Image as XLImage
+                    hoja_img = writer.book.create_sheet('Ploteo', 0)
+                    imagen = XLImage(ruta_png)
+                    escala = 1400 / imagen.width
+                    imagen.width, imagen.height = imagen.width * escala, imagen.height * escala
+                    hoja_img.add_image(imagen, 'A1')
+                except Exception as e:
+                    print(f"No se pudo insertar el ploteo en el Excel: {e}")
+
+    def LoadCarpetaPlan(self):
+        """Botón CarpetaPlan: selecciona y lee la carpeta con SEM*/PERFO*/Progress/Vias (DXF)."""
+        self.Mensajes.clear()
+        carpeta = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de planificación (SEM / PERFO / Progress / Vias)")
+        if not carpeta:
+            return
+        try:
+            # El año de las fechas ddmm de los nombres se infiere respecto a la fecha de corte.
+            fecha_ref = pd.to_datetime(self.df['Fecha'], errors='coerce').max() if hasattr(self, 'df') else pd.Timestamp.today()
+            fecha_ref = fecha_ref.normalize() if pd.notna(fecha_ref) else pd.Timestamp.today().normalize()
+            zonas = self._cargar_zonas_planificacion(carpeta, fecha_ref)
+            if not zonas['archivos']:
+                QMessageBox.warning(self, "Carpeta de planificación", "\n".join(zonas['avisos']) or "No se reconoció ningún DXF.")
+                return
+            self.ruta_plan, self.zonas_plan, self.zonas_plan_fecha_ref = carpeta, zonas, fecha_ref
+            texto = "\n".join(f"{a['Tipo']}: {a['Archivo']} — {a['Detalle']}" for a in zonas['archivos'])
+            if zonas['avisos']:
+                texto += "\n\nObservaciones:\n- " + "\n- ".join(zonas['avisos'])
+            QMessageBox.information(self, "Carpeta de planificación", texto)
+            self.Mensajes.setText(f"Carpeta de planificación cargada ({len(zonas['archivos'])} DXF)")
+            self.GenerarPlan.setEnabled(hasattr(self, 'ruta_ctrl_proceso'))
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"No se pudo leer la carpeta de planificación:\n{type(e).__name__}: {e}")
+            self.Mensajes.setText("Ocurrio algun error al leer la carpeta de planificacion")
+
+    def PlanificarPerforacion(self):
+        """Botón GenerarPlan: arma el plan hasta perforar todos los puntos pendientes de la hoja
+        DDH con las zonas de la carpeta de planificación, lo exporta a Excel (+ PNG) y muestra el
+        ploteo interactivo (filtrable por mes)."""
+        self.Mensajes.clear()
+        if not hasattr(self, 'df') or not hasattr(self, 'ruta_ctrl_proceso'):
+            QMessageBox.warning(self, "Aviso", "Cargue primero los Reportes y el Control de Proceso.")
+            return
+        if not hasattr(self, 'zonas_plan'):
+            QMessageBox.warning(self, "Aviso", "Seleccione primero la carpeta de planificación (SEM / PERFO / Progress / Vias).")
+            return
+        try:
+            carpeta = self.ruta_plan
+            rendimiento, corte = self._rendimiento_maquinas()
+            if abs((corte - self.zonas_plan_fecha_ref).days) > 60:  # se cargó la carpeta antes que los reportes
+                self.zonas_plan = self._cargar_zonas_planificacion(carpeta, corte)
+                self.zonas_plan_fecha_ref = corte
+            zonas = self.zonas_plan
+            pendientes, compromisos, sin_coordenadas, avisos = self._leer_ddh_planificacion()
+            if pendientes.empty:
+                QMessageBox.information(self, "Plan de Perforación", "No hay plataformas pendientes en la hoja DDH.")
+                return
+            plan, estado_compromisos, avisos_plan = self._planificar_perforacion(pendientes, compromisos, rendimiento, zonas, corte)
+            avisos += avisos_plan
+            if plan.empty:
+                QMessageBox.warning(self, "Plan de Perforación", "\n".join(avisos) or "No se pudo armar el plan.")
+                return
+            self.plan_perforacion = plan
+
+            nombre = f"Plan_Perforacion_{plan['Fecha_Inicio'].min():%Y-%m-%d}.xlsx"
+            ruta, _ = QFileDialog.getSaveFileName(self, "Guardar Plan de Perforación", os.path.join(carpeta, nombre),
+                                                  "Excel Files (*.xlsx)")
+            if ruta:
+                ruta_png = os.path.splitext(ruta)[0] + ".png"
+                self._render_plan_png(plan, estado_compromisos, zonas, ruta_png)
+                self._exportar_plan_excel(ruta, plan, estado_compromisos, rendimiento, sin_coordenadas, zonas, avisos, ruta_png)
+
+            resumen = plan.groupby('Mes', sort=False)['N'].count()
+            texto = (f"Plan: {len(plan)} puntos, {plan['Maquina'].nunique()} máquinas, "
+                     f"{plan['Fecha_Inicio'].min():%d/%m/%Y} a {plan['Fecha_Fin'].max():%d/%m/%Y}\n"
+                     + " | ".join(f"{m}: {n}" for m, n in resumen.items()))
+            self.Mensajes.setText(texto)
+            mensaje = texto + (f"\n\nExportado a:\n{ruta}" if ruta else "")
+            todos_avisos = avisos + zonas['avisos']
+            if todos_avisos:
+                mensaje += "\n\nObservaciones:\n- " + "\n- ".join(todos_avisos[:12])
+            QMessageBox.information(self, "Plan de Perforación", mensaje)
+            self._plot_plan_interactivo(plan, estado_compromisos, zonas)
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error en el plan de perforación", f"{type(e).__name__}: {e}")
+            self.Mensajes.setText("Ocurrio algun error al generar el plan de perforacion")
+
+    def _plot_plan_interactivo(self, plan, compromisos, zonas):
+        from matplotlib.widgets import RadioButtons
+        fig, ax = plt.subplots(figsize=(16, 10))
+        plt.subplots_adjust(left=0.17, right=0.80)
+        artistas_por_mes = self._dibujar_plan_perforacion(ax, plan, compromisos, zonas, fontsize=7)
+        titulo = "Plan de Perforación — {}"
+        ax.set_title(titulo.format("todos los meses"), fontweight='bold')
+        opciones = ['Todos'] + list(artistas_por_mes)
+        ax_radio = fig.add_axes([0.01, 0.55, 0.12, 0.04 * len(opciones) + 0.02])
+        ax_radio.set_title('Mes', fontsize=9, fontweight='bold')
+        self.radio_plan_mes = RadioButtons(ax_radio, opciones, active=0)
+
+        def filtrar(opcion):
+            for mes, artistas in artistas_por_mes.items():
+                for artista in artistas:
+                    artista.set_visible(opcion == 'Todos' or opcion == mes)
+            ax.set_title(titulo.format("todos los meses" if opcion == 'Todos' else opcion), fontweight='bold')
+            fig.canvas.draw_idle()
+
+        self.radio_plan_mes.on_clicked(filtrar)
+        try:
+            cursor = mplcursors.cursor([a for lista in artistas_por_mes.values() for a in lista
+                                        if hasattr(a, 'get_offsets')], hover=True)
+            puntos = {(round(r['ESTE'], 1), round(r['NORTE'], 1)): r for _, r in plan.iterrows()}
+
+            def al_pasar(sel):
+                x, y = sel.artist.get_offsets()[sel.index]
+                r = puntos.get((round(x, 1), round(y, 1)))
+                if r is None:
+                    return
+                sel.annotation.set_text(
+                    f"N° {r['N']} — {r['Plataforma']}\nMáquina: {r['Maquina']} ({r['Rendimiento_m_dia']:.1f} m/día)\n"
+                    f"LENGTH: {r['LENGTH_m']:.0f} m | {r['Dias_Totales']} d (1+{r['Dias_Perforacion']}+1)\n"
+                    f"{r['Fecha_Inicio']:%d/%m/%Y} → {r['Fecha_Fin']:%d/%m/%Y}\nDesde: {r['Desde_Plataforma']} ({r['Distancia_m']:.0f} m)\n"
+                    f"Zona: {r['Zona']}" + (f"\nEspera {r['Espera_dias']} d: {r['Motivo_Espera']}" if r['Espera_dias'] else ""))
+            cursor.connect("add", al_pasar)
+            self.cursor_plan = cursor
+        except Exception as e:
+            print(f"Hover del plan no disponible: {e}")
+        plt.show()
 
     def toggle_text(self):
         if self.aboutlabel.isHidden():
