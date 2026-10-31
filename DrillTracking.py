@@ -5510,6 +5510,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         # Rayado rojo (no sólido) para que no se confunda con una máquina de color rojizo.
         conflicto_fill = PatternFill('lightUp', fgColor='FF0000', bgColor='FFE5E5')
         curso_fill = PatternFill('solid', fgColor='BFBFBF')
+        espera_fill = PatternFill('solid', fgColor='FFF2CC')
 
         def barra(fila, f_ini, f_fin, texto, relleno, fuente=None):
             c1, c2 = col_de(f_ini), col_de(f_fin)
@@ -5541,6 +5542,13 @@ class MyApp(QMainWindow, Ui_MainWindow):
             for _, r in sub.iterrows():
                 conflicto = bool(r.get('Conflicto', False))
                 f_ini, f_fin = r['Fecha_Inicio'], r['Fecha_Fin']
+                # Hueco entre que la máquina se libera y entra al punto: se rotula con su motivo
+                # (fecha indicada en el plan manual, ventana SEM/PERFO o vía ocupada por otra máquina).
+                espera = int(r.get('Espera_dias', 0) or 0)
+                if espera > 0:
+                    motivo = str(r.get('Motivo_Espera') or "").strip() or "sin detalle"
+                    barra(fila, f_ini - pd.Timedelta(days=espera), f_ini - un_dia,
+                          f"Espera {espera} d: {motivo}", espera_fill, Font(size=7, italic=True, color='7F6000'))
                 n_inst, n_desm = int(r['Dias_Instalacion']), int(r['Dias_Desmovilizacion'])
                 perf_ini, perf_fin = f_ini + pd.Timedelta(days=n_inst), f_fin - pd.Timedelta(days=n_desm)
                 for k in range(n_inst):
@@ -5571,7 +5579,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
         fila += 1
         for texto, relleno in (("Perforación (color de la máquina)", None), ("I / D = instalación / desmovilización", None),
-                               ("(M) = punto del plan manual", None),
+                               ("(M) = punto del plan manual", None), ("Espera (máquina libre, aún no puede ingresar)", espera_fill),
                                ("En curso (Perforando / Preinicio actual)", curso_fill)):
             celda = ws.cell(fila, 1, texto)
             celda.font = Font(size=9)
