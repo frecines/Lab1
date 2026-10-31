@@ -4970,6 +4970,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
             'Fecha_Inicio': inicio, 'Fecha_Fin': inicio + duracion - pd.Timedelta(days=1),
             'Espera_dias': espera, 'Motivo_Espera': motivo if espera > 0 else "",
             'Zona': rest['zona'], 'Conflicto': False, 'Motivo_Conflicto': "", 'Fecha_Sugerida': pd.NaT, 'Ajuste': "",
+            'Origen': "Automático", 'Observacion': "",
         }
 
     def _completar_columnas_plan(self, plan):
@@ -4984,25 +4985,19 @@ class MyApp(QMainWindow, Ui_MainWindow):
         plan.insert(2, 'Horizonte', np.select([indice_mes <= 0, indice_mes <= 2], ["Mes 1", "Meses 2-3"], "Posterior"))
         return plan
 
-    def _planificar_perforacion(self, pendientes, compromisos, rendimiento, zonas, corte):
-        """Asignación voraz por eventos hasta perforar todos los puntos pendientes:
+    def _asignar_voraz(self, pendientes, maquinas, ocupacion_vias, zonas):
+        """Asignación voraz por eventos hasta perforar todos los `pendientes`, partiendo del
+        estado de `maquinas` (posición y fecha en que se liberan) y de las vías ya ocupadas:
         la máquina que se libera primero (empate: la de mejor rendimiento) toma el punto libre
         más cercano a su posición (Progress no minado en el mes se ve PLAN_FACTOR_PROGRESS más
         cerca) que pueda ocupar sin esperar; si ninguno está libre ya, el que antes se libere.
-        Días por punto = instalación + ceil(LENGTH / rendimiento) + desmovilización.
-        Devuelve (plan, estado_compromisos, avisos)."""
-        avisos = []
-        rates = self._resolver_rendimientos(compromisos['Maquina'], rendimiento, avisos)
-        maquinas, estado_compromisos, ocupacion_vias = self._estado_inicial_maquinas(compromisos, rates, zonas, corte)
-        if not maquinas:
-            avisos.append("No hay máquinas en Perforando/Preinicio con nombre (columna W): no se puede planificar.")
-            return pd.DataFrame(), estado_compromisos, avisos
-
-        centro = (pendientes['ESTE'].mean(), pendientes['NORTE'].mean()) if not pendientes.empty else (0.0, 0.0)
+        Modifica `maquinas` y `ocupacion_vias` y devuelve las filas del plan."""
+        if not maquinas or pendientes.empty:
+            return []
+        centro = (pendientes['ESTE'].mean(), pendientes['NORTE'].mean())
         for datos in maquinas.values():
             if datos['pos'] is None:
                 datos['pos'], datos['plataforma'] = centro, "(sin coordenadas)"
-
         restricciones = [self._restricciones_punto(r['ESTE'], r['NORTE'], zonas) for _, r in pendientes.iterrows()]
         libres = set(range(len(pendientes)))
         filas = []
@@ -5031,7 +5026,19 @@ class MyApp(QMainWindow, Ui_MainWindow):
                                          espera=(inicio - datos['t_libre']).days, motivo=motivo))
             datos.update({'t_libre': fin, 'pos': (float(p['ESTE']), float(p['NORTE'])), 'plataforma': p['Plataforma']})
             libres.discard(i)
+        return filas
 
+    def _planificar_perforacion(self, pendientes, compromisos, rendimiento, zonas, corte):
+        """Plan automático: cada máquina termina lo que tiene en curso y luego se asignan todos
+        los puntos pendientes con _asignar_voraz. Días por punto = instalación +
+        ceil(LENGTH / rendimiento) + desmovilización. Devuelve (plan, estado_compromisos, avisos)."""
+        avisos = []
+        rates = self._resolver_rendimientos(compromisos['Maquina'], rendimiento, avisos)
+        maquinas, estado_compromisos, ocupacion_vias = self._estado_inicial_maquinas(compromisos, rates, zonas, corte)
+        if not maquinas:
+            avisos.append("No hay máquinas en Perforando/Preinicio con nombre (columna W): no se puede planificar.")
+            return pd.DataFrame(), estado_compromisos, avisos
+        filas = self._asignar_voraz(pendientes, maquinas, ocupacion_vias, zonas)
         return self._completar_columnas_plan(pd.DataFrame(filas)), estado_compromisos, avisos
 
     # ---------------------------------------------------------------- plan manual
@@ -5042,21 +5049,18 @@ class MyApp(QMainWindow, Ui_MainWindow):
         puntos pendientes sin máquina). Hojas de referencia con listas desplegables."""
         from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.worksheet.datavalidation import DataValidation
+        # Máquina / Orden quedan VACÍOS: solo se llenan los puntos que se quieren fijar; la propuesta
+        # automática va en las columnas Ref_* (solo referencia, no se leen al cargar).
         columnas = ['Maquina', 'Orden', 'Plataforma', 'Fecha_Inicio', 'Rendimiento_m_dia', 'Observacion',
-                    'Ref_Fecha_Inicio_Auto', 'Ref_Fecha_Fin_Auto', 'Ref_Situacion']
+                    'Ref_Maquina_Auto', 'Ref_Orden_Auto', 'Ref_Fecha_Inicio_Auto', 'Ref_Fecha_Fin_Auto', 'Ref_Situacion']
+        plantilla = pd.DataFrame({'Plataforma': pendientes['Plataforma'], 'Ref_Situacion': "Pendiente"})
         if plan_base is not None and not plan_base.empty:
-            base = plan_base.sort_values(['Maquina', 'Secuencia_Maquina'])
-            plantilla = pd.DataFrame({'Maquina': base['Maquina'], 'Orden': base['Secuencia_Maquina'],
-                                      'Plataforma': base['Plataforma'], 'Fecha_Inicio': None, 'Rendimiento_m_dia': None,
-                                      'Observacion': "", 'Ref_Fecha_Inicio_Auto': base['Fecha_Inicio'].dt.date,
-                                      'Ref_Fecha_Fin_Auto': base['Fecha_Fin'].dt.date, 'Ref_Situacion': "Pendiente"})
-            faltan = pendientes[~pendientes['Plataforma'].isin(base['Plataforma'])]
-        else:
-            plantilla = pd.DataFrame(columns=columnas)
-            faltan = pendientes
-        if not faltan.empty:
-            plantilla = pd.concat([plantilla, pd.DataFrame({'Maquina': "", 'Orden': None, 'Plataforma': faltan['Plataforma'],
-                                                            'Ref_Situacion': "Pendiente (sin asignar)"})], ignore_index=True)
+            base = plan_base.set_index('Plataforma')
+            plantilla['Ref_Maquina_Auto'] = plantilla['Plataforma'].map(base['Maquina'])
+            plantilla['Ref_Orden_Auto'] = plantilla['Plataforma'].map(base['Secuencia_Maquina'])
+            plantilla['Ref_Fecha_Inicio_Auto'] = plantilla['Plataforma'].map(base['Fecha_Inicio'].dt.date)
+            plantilla['Ref_Fecha_Fin_Auto'] = plantilla['Plataforma'].map(base['Fecha_Fin'].dt.date)
+            plantilla = plantilla.sort_values(['Ref_Maquina_Auto', 'Ref_Orden_Auto'], na_position='last')
         plantilla = plantilla.reindex(columns=columnas)
 
         maquinas = (estado_compromisos.groupby('Maquina')
@@ -5072,8 +5076,12 @@ class MyApp(QMainWindow, Ui_MainWindow):
             "3. Rendimiento_m_dia es opcional: vacío = rendimiento de los últimos 15 días de la máquina.",
             f"4. Días por punto = {PLAN_DIAS_INSTALACION} instalación + LENGTH / rendimiento + {PLAN_DIAS_DESMOVILIZACION} desmovilización.",
             "5. Filas sin Máquina se ignoran. Las columnas Ref_* son solo de referencia (no se leen).",
-            "6. Cargue el archivo con el botón 'Cargar Plan Manual': se recalculan fechas y se avisa qué puntos",
-            "   no se podrán ingresar (cruce con SEM / PERFO en sus fechas o vía cerrada por otra máquina).",
+            "6. Basta con indicar los próximos puntos de las máquinas que quiera fijar (ej. el siguiente de cada una):",
+            "   al cargar con 'Cargar Plan Manual' esos puntos se respetan y el resto del plan se completa",
+            "   automáticamente desde donde y cuando cada máquina los termina.",
+            "7. Si un punto manual no se puede ingresar (cruce con SEM / PERFO en sus fechas, vía cerrada por otra",
+            "   máquina, ya ejecutado, etc.) no se considera: se reprograma automáticamente y el motivo queda en la",
+            "   hoja Manual_No_Considerado del Excel generado.",
             "Hojas de referencia: Maquinas (rendimiento y fecha en que se liberan) y Plataformas (situación de cada una).",
         ]})
 
@@ -5097,9 +5105,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
             ref = PatternFill('solid', fgColor='EDEDED')
             for fila in hoja.iter_rows(min_row=2, max_row=ultima):
                 fila[3].number_format = 'DD/MM/YYYY'
-                for celda in fila[6:9]:
+                for k, celda in enumerate(fila[6:11], start=6):
                     celda.fill = ref
-                    celda.number_format = 'DD/MM/YYYY'
+                    if k in (8, 9):  # Ref_Fecha_Inicio_Auto / Ref_Fecha_Fin_Auto
+                        celda.number_format = 'DD/MM/YYYY'
             for rango, origen, n in (("A2:A%d" % ultima, 'Maquinas', len(maquinas)), ("C2:C%d" % ultima, 'Plataformas', len(plataformas))):
                 if n:
                     validacion = DataValidation(type="list", formula1=f"={origen}!$A$2:$A${n + 1}", allow_blank=True,
@@ -5130,98 +5139,140 @@ class MyApp(QMainWindow, Ui_MainWindow):
         df['Rendimiento_m_dia'] = pd.to_numeric(df['Rendimiento_m_dia'], errors='coerce')
         return df[(df['Maquina'] != "") & (df['Plataforma'] != "")].reset_index(drop=True)
 
-    def _aplicar_plan_manual(self, manual, catalogo, compromisos, rendimiento, zonas, corte):
-        """Recalcula el plan armado a mano: respeta la máquina y el orden de cada punto, calcula
-        las fechas de ingreso con el rendimiento (o el indicado en la fila) y marca como
-        CONFLICTO (no podrá ingresar) los puntos cuya ocupación se cruza con un SEM / PERFO que
-        lo contiene en sus fechas, o con otra máquina en el mismo tramo de vía; para esos sugiere
-        la primera fecha factible. Devuelve (plan, estado_compromisos, rechazados, avisos)."""
-        avisos, rechazados, filas = [], [], []
+    @staticmethod
+    def _clave_plataforma(nombre):
+        return str(nombre).upper().replace(" ", "")
+
+    def _aplicar_plan_manual(self, manual, catalogo, pendientes, compromisos, rendimiento, zonas, corte):
+        """Plan manual + completado automático:
+        1) Los puntos del plan manual se toman como los PRÓXIMOS movimientos de cada máquina
+           (en su orden), con fechas según el rendimiento (o el indicado en la fila) y
+           1 día de instalación + 1 de desmovilización. Se evalúan en orden cronológico.
+        2) Un punto manual que no se puede ingresar (su ocupación se cruza con un SEM / PERFO
+           que lo contiene en sus fechas, o con otra máquina en el mismo tramo de vía) o que no
+           es válido (no existe, ya ejecutado, en curso, repetido, sin coordenadas) NO se
+           considera: la máquina sigue con su siguiente punto y la plataforma vuelve a la cola.
+        3) El resto de puntos pendientes se completa con el plan automático, partiendo de donde
+           y cuando cada máquina termina sus puntos manuales.
+        Devuelve (plan, estado_compromisos, no_considerados, avisos)."""
+        avisos, no_considerados, filas = [], [], []
         rates = self._resolver_rendimientos(list(compromisos['Maquina']) + list(manual['Maquina']), rendimiento, avisos)
         maquinas, estado_compromisos, ocupacion_vias = self._estado_inicial_maquinas(compromisos, rates, zonas, corte)
         inicio_plan = corte + pd.Timedelta(days=1)
         mediana_len = catalogo['LENGTH'].median()
         mediana_len = float(mediana_len) if pd.notna(mediana_len) else 300.0
-        usadas = set()
-        manual = manual.assign(_orden=manual['Orden'].fillna(np.inf)).sort_values(['Maquina', '_orden', 'Fila_Excel'])
-        for maquina, grupo in manual.groupby('Maquina', sort=False):
-            if maquina not in maquinas:
-                maquinas[maquina] = {'t_libre': inicio_plan, 'pos': None, 'plataforma': "(ingreso)", 'rate': rates[maquina]}
-                avisos.append(f"Máquina '{maquina}' no está Perforando/Preinicio en la hoja DDH: se asume disponible "
-                              f"desde {inicio_plan:%d/%m/%Y}.")
-            datos = maquinas[maquina]
-            for _, fila in grupo.iterrows():
-                key = fila['Plataforma'].upper().replace(" ", "")
-                motivo = None
-                if key not in catalogo.index:
-                    motivo = "La plataforma no existe en la hoja DDH"
-                elif key in usadas:
-                    motivo = "Plataforma repetida en el plan manual"
-                else:
-                    cat = catalogo.loc[key]
-                    if cat['Situacion'] == "Ejecutada":
-                        motivo = "La plataforma ya está Ejecutada"
-                    elif cat['Situacion'].startswith("En curso"):
-                        motivo = f"La plataforma ya está {cat['Situacion']}"
-                    elif pd.isna(cat['ESTE']) or pd.isna(cat['NORTE']):
-                        motivo = "La plataforma no tiene coordenadas ESTE/NORTE"
-                if motivo:
-                    rechazados.append({'Fila_Excel': fila['Fila_Excel'], 'Maquina': maquina, 'Plataforma': fila['Plataforma'], 'Motivo': motivo})
-                    continue
-                usadas.add(key)
-                x, y = float(cat['ESTE']), float(cat['NORTE'])
-                estimado = pd.isna(cat['LENGTH']) or cat['LENGTH'] <= 0
-                p = {'Plataforma': cat['Plataforma'], 'Identificador': cat['Identificador'], 'Status': cat['Status'],
-                     'ESTE': x, 'NORTE': y, 'ELEV': cat['ELEV'], 'LENGTH': mediana_len if estimado else float(cat['LENGTH']),
-                     'LENGTH_estimado': estimado}
-                rate = float(fila['Rendimiento_m_dia']) if pd.notna(fila['Rendimiento_m_dia']) and fila['Rendimiento_m_dia'] > 0 else maquinas[maquina]['rate']
-                dias_perf = p['LENGTH'] / rate
-                duracion = pd.Timedelta(days=PLAN_DIAS_INSTALACION + int(np.ceil(dias_perf)) + PLAN_DIAS_DESMOVILIZACION)
-                inicio, ajuste = datos['t_libre'], ""
-                if pd.notna(fila['Fecha_Inicio']):
-                    if fila['Fecha_Inicio'] >= inicio:
-                        inicio = fila['Fecha_Inicio']
-                    else:
-                        ajuste = (f"Fecha pedida {fila['Fecha_Inicio']:%d/%m/%Y} no es posible: {maquina} sigue en "
-                                  f"{datos['plataforma']} hasta el {inicio - pd.Timedelta(days=1):%d/%m/%Y}; "
-                                  f"se reprograma al {inicio:%d/%m/%Y}.")
-                if datos['pos'] is None:
-                    datos['pos'] = (x, y)
-                rest = self._restricciones_punto(x, y, zonas)
-                fila_plan = self._fila_plan(maquina, dict(datos, rate=rate), p, rest, inicio, duracion, dias_perf,
-                                            float(np.hypot(x - datos['pos'][0], y - datos['pos'][1])))
-                fila_plan.update({'Ajuste': ajuste, 'Observacion': fila['Observacion'], 'Orden_Manual': fila['Orden'],
-                                  '_bloqueos': rest['bloqueos'], '_vias': rest['vias']})
-                filas.append(fila_plan)
-                datos.update({'t_libre': inicio + duracion, 'pos': (x, y), 'plataforma': cat['Plataforma']})
-
-        # Conflictos: se revisan en orden cronológico; ante dos máquinas en el mismo tramo de vía
-        # al mismo tiempo, queda marcado el punto que ingresa después.
         un_dia = pd.Timedelta(days=1)
-        ocupadas = {via: list(lista) for via, lista in ocupacion_vias.items()}
-        for k in sorted(range(len(filas)), key=lambda k: (filas[k]['Fecha_Inicio'], k)):
-            r = filas[k]
-            ini, fin, x, y = r['Fecha_Inicio'], r['Fecha_Fin'] + un_dia, r['ESTE'], r['NORTE']
-            motivos = [f"{mot} se cruza con la ocupación {ini:%d/%m}-{fin - un_dia:%d/%m}"
-                       for b_ini, b_fin, mot in r['_bloqueos'] if ini < b_fin and fin > b_ini]
-            otras = {via: [o for o in ocupadas.get(via, []) if o[2] != r['Maquina']] for via in r['_vias']}
-            for via, lista in otras.items():
-                for o_ini, o_fin, o_maq, ox, oy in lista:
-                    distancia = float(np.hypot(x - ox, y - oy))
-                    if ini < o_fin and fin > o_ini and distancia <= PLAN_TRAMO_VIA_M:
-                        motivos.append(f"vía {via} cerrada por {o_maq} ({o_ini:%d/%m}-{o_fin - un_dia:%d/%m}, a {distancia:.0f} m)")
-            if motivos:
-                r['Conflicto'] = True
-                r['Motivo_Conflicto'] = "No podrá ingresar: " + "; ".join(motivos)
-                r['Fecha_Sugerida'] = self._primer_inicio_factible(ini, fin - ini, r['_bloqueos'], r['_vias'], otras, x, y)[0]
-            for via in r['_vias']:
-                ocupadas.setdefault(via, []).append((ini, fin, r['Maquina'], x, y))
 
-        rechazados = pd.DataFrame(rechazados, columns=['Fila_Excel', 'Maquina', 'Plataforma', 'Motivo'])
+        def descartar(fila, motivo, key=None):
+            no_considerados.append({'Fila_Excel': fila['Fila_Excel'], 'Maquina': fila['Maquina'], 'Orden': fila['Orden'],
+                                    'Plataforma': fila['Plataforma'], 'Motivo': motivo, '_key': key})
+
+        # 1) Validación de cada fila y cola de puntos manuales por máquina
+        colas, usadas = {}, set()
+        manual = manual.assign(_orden=manual['Orden'].fillna(np.inf)).sort_values(['Maquina', '_orden', 'Fila_Excel'])
+        for _, fila in manual.iterrows():
+            key = self._clave_plataforma(fila['Plataforma'])
+            if key not in catalogo.index:
+                descartar(fila, "La plataforma no existe en la hoja DDH")
+                continue
+            cat = catalogo.loc[key]
+            if key in usadas:
+                descartar(fila, "Plataforma repetida en el plan manual (se usó la primera fila)")
+                continue
+            if cat['Situacion'] == "Ejecutada":
+                descartar(fila, "La plataforma ya está Ejecutada", key)
+                continue
+            if cat['Situacion'].startswith("En curso"):
+                descartar(fila, f"La plataforma ya está {cat['Situacion']}", key)
+                continue
+            if pd.isna(cat['ESTE']) or pd.isna(cat['NORTE']):
+                descartar(fila, "La plataforma no tiene coordenadas ESTE/NORTE", key)
+                continue
+            usadas.add(key)
+            colas.setdefault(fila['Maquina'], []).append((fila, key, cat))
+            if fila['Maquina'] not in maquinas:
+                maquinas[fila['Maquina']] = {'t_libre': inicio_plan, 'pos': None, 'plataforma': "(ingreso)",
+                                             'rate': rates[fila['Maquina']]}
+                avisos.append(f"Máquina '{fila['Maquina']}' no está Perforando/Preinicio en la hoja DDH: se asume "
+                              f"disponible desde {inicio_plan:%d/%m/%Y}.")
+
+        # 2) Simulación cronológica: siempre se evalúa el próximo punto manual que antes empezaría
+        aceptadas = set()
+        while any(colas.values()):
+            candidatos = []
+            for maquina, cola in colas.items():
+                if cola:
+                    fila = cola[0][0]
+                    inicio = maquinas[maquina]['t_libre']
+                    if pd.notna(fila['Fecha_Inicio']) and fila['Fecha_Inicio'] > inicio:
+                        inicio = fila['Fecha_Inicio']
+                    candidatos.append((inicio, maquina))
+            inicio, maquina = min(candidatos)
+            fila, key, cat = colas[maquina].pop(0)
+            datos = maquinas[maquina]
+            ajuste = ""
+            if pd.notna(fila['Fecha_Inicio']) and fila['Fecha_Inicio'] < datos['t_libre']:
+                ajuste = (f"Fecha pedida {fila['Fecha_Inicio']:%d/%m/%Y} no es posible: {maquina} sigue en "
+                          f"{datos['plataforma']} hasta el {datos['t_libre'] - un_dia:%d/%m/%Y}; ingresa el {inicio:%d/%m/%Y}.")
+            x, y = float(cat['ESTE']), float(cat['NORTE'])
+            estimado = pd.isna(cat['LENGTH']) or cat['LENGTH'] <= 0
+            p = {'Plataforma': cat['Plataforma'], 'Identificador': cat['Identificador'], 'Status': cat['Status'],
+                 'ESTE': x, 'NORTE': y, 'ELEV': cat['ELEV'], 'LENGTH': mediana_len if estimado else float(cat['LENGTH']),
+                 'LENGTH_estimado': estimado}
+            rate = float(fila['Rendimiento_m_dia']) if pd.notna(fila['Rendimiento_m_dia']) and fila['Rendimiento_m_dia'] > 0 else datos['rate']
+            dias_perf = p['LENGTH'] / rate
+            duracion = pd.Timedelta(days=PLAN_DIAS_INSTALACION + int(np.ceil(dias_perf)) + PLAN_DIAS_DESMOVILIZACION)
+            fin = inicio + duracion
+            rest = self._restricciones_punto(x, y, zonas)
+            motivos = [f"{mot} se cruza con la ocupación prevista {inicio:%d/%m}-{fin - un_dia:%d/%m}"
+                       for b_ini, b_fin, mot in rest['bloqueos'] if inicio < b_fin and fin > b_ini]
+            for via in rest['vias']:
+                for o_ini, o_fin, o_maq, ox, oy in ocupacion_vias.get(via, []):
+                    distancia_via = float(np.hypot(x - ox, y - oy))
+                    if o_maq != maquina and inicio < o_fin and fin > o_ini and distancia_via <= PLAN_TRAMO_VIA_M:
+                        motivos.append(f"vía {via} cerrada por {o_maq} ({o_ini:%d/%m}-{o_fin - un_dia:%d/%m}, a {distancia_via:.0f} m)")
+            if motivos:
+                descartar(fila, "No se puede ingresar: " + "; ".join(motivos), key)
+                continue
+            if datos['pos'] is None:
+                datos['pos'] = (x, y)
+            fila_plan = self._fila_plan(maquina, dict(datos, rate=rate), p, rest, inicio, duracion, dias_perf,
+                                        float(np.hypot(x - datos['pos'][0], y - datos['pos'][1])),
+                                        espera=(inicio - datos['t_libre']).days,
+                                        motivo="Fecha indicada en el plan manual" if inicio > datos['t_libre'] else "")
+            fila_plan.update({'Origen': "Manual", 'Ajuste': ajuste, 'Observacion': fila['Observacion'], 'Orden_Manual': fila['Orden']})
+            filas.append(fila_plan)
+            for via in rest['vias']:
+                ocupacion_vias.setdefault(via, []).append((inicio, fin, maquina, x, y))
+            datos.update({'t_libre': fin, 'pos': (x, y), 'plataforma': cat['Plataforma']})
+            aceptadas.add(key)
+
+        # 3) Completar con el plan automático el resto de puntos pendientes
+        restantes = pendientes[~pendientes['Plataforma'].map(self._clave_plataforma).isin(aceptadas)].reset_index(drop=True)
+        if not maquinas and not restantes.empty:
+            avisos.append("No hay máquinas para completar el plan automático.")
+        filas += self._asignar_voraz(restantes, maquinas, ocupacion_vias, zonas)
         if not filas:
-            return pd.DataFrame(), estado_compromisos, rechazados, avisos
-        plan = pd.DataFrame(filas).drop(columns=['_bloqueos', '_vias'])
-        return self._completar_columnas_plan(plan), estado_compromisos, rechazados, avisos
+            return pd.DataFrame(), estado_compromisos, pd.DataFrame(no_considerados), avisos
+        plan = self._completar_columnas_plan(pd.DataFrame(filas))
+
+        # 4) Qué pasó con cada punto manual no considerado
+        por_clave = {self._clave_plataforma(r['Plataforma']): r for _, r in plan.iterrows()}
+        for nc in no_considerados:
+            r = por_clave.get(nc['_key'])
+            if r is not None and r['Origen'] != "Manual":
+                nc['Resultado'] = (f"Reprogramado automáticamente: N° {r['N']}, {r['Maquina']}, "
+                                   f"{r['Fecha_Inicio']:%d/%m/%Y} a {r['Fecha_Fin']:%d/%m/%Y}")
+                plan.loc[plan['N'] == r['N'], 'Observacion'] = (
+                    f"Reemplaza punto manual ({nc['Maquina']}, orden {nc['Orden']:g}): {nc['Motivo']}"
+                    if pd.notna(nc['Orden']) else f"Reemplaza punto manual ({nc['Maquina']}): {nc['Motivo']}")
+            elif r is not None:
+                nc['Resultado'] = f"Queda en el plan manual de {r['Maquina']} (N° {r['N']})"
+            else:
+                nc['Resultado'] = "No se programa (no es un punto pendiente)"
+        no_considerados = pd.DataFrame(no_considerados, columns=['Fila_Excel', 'Maquina', 'Orden', 'Plataforma', 'Motivo',
+                                                                 'Resultado', '_key']).drop(columns='_key')
+        return plan, estado_compromisos, no_considerados, avisos
 
     # ---------------------------------------------------------------- ploteo
     def _dibujar_plan_perforacion(self, ax, plan, compromisos, zonas, fontsize=7):
@@ -5297,7 +5348,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
             # Etiqueta corta (las plataformas están a ~60 m): el color ya indica la máquina y las
             # fechas van en el Excel / en el hover de la vista interactiva.
             registrar('Etiquetas', ax.text(r['ESTE'] + 13, r['NORTE'] + 6,
-                                           f"{r['Plataforma']} · {r['Dias_Totales']} d" + (" ⚠" if conflicto else ""),
+                                           f"{r['Plataforma']} · {r['Dias_Totales']} d" + (" (M)" if r.get('Origen') == "Manual" else "")
+                                           + (" ⚠" if conflicto else ""),
                                            fontsize=fontsize - 1, ha='left', va='bottom', zorder=5, clip_on=True,
                                            color='#C00000' if conflicto else '#222222',
                                            fontweight='bold' if conflicto else 'normal'), mes)
@@ -5380,7 +5432,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 r = puntos.get((round(x, 1), round(y, 1)))
                 if r is None:
                     return
-                texto = (f"N° {r['N']} — {r['Plataforma']}\nMáquina: {r['Maquina']} ({r['Rendimiento_m_dia']:.1f} m/día)\n"
+                texto = (f"N° {r['N']} — {r['Plataforma']} [{r.get('Origen', 'Automático')}]\nMáquina: {r['Maquina']} ({r['Rendimiento_m_dia']:.1f} m/día)\n"
                          f"LENGTH: {r['LENGTH_m']:.0f} m | {r['Dias_Totales']} d (1+{r['Dias_Perforacion']}+1)\n"
                          f"{r['Fecha_Inicio']:%d/%m/%Y} → {r['Fecha_Fin']:%d/%m/%Y}\nDesde: {r['Desde_Plataforma']} ({r['Distancia_m']:.0f} m)\n"
                          f"Zona: {r['Zona']}")
@@ -5388,6 +5440,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     texto += f"\nEspera {r['Espera_dias']} d: {r['Motivo_Espera']}"
                 if r.get('Ajuste'):
                     texto += f"\n{r['Ajuste']}"
+                if r.get('Observacion'):
+                    texto += f"\n{r['Observacion']}"
                 if r.get('Conflicto'):
                     texto += f"\n⚠ {r['Motivo_Conflicto']}"
                     if pd.notna(r.get('Fecha_Sugerida')):
@@ -5495,7 +5549,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     dia = f_fin - pd.Timedelta(days=k)
                     barra(fila, dia, dia, "D", conflicto_fill if conflicto else suave, Font(size=7))
                 if perf_fin >= perf_ini:
-                    texto = f"{'⚠ ' if conflicto else ''}{r['N']}. {r['Plataforma']} ({r['LENGTH_m']:.0f} m)"
+                    manual = " (M)" if r.get('Origen') == "Manual" else ""
+                    texto = f"{'⚠ ' if conflicto else ''}{r['N']}. {r['Plataforma']}{manual} ({r['LENGTH_m']:.0f} m)"
                     barra(fila, perf_ini, perf_fin, texto, conflicto_fill if conflicto else fuerte,
                           Font(size=8, bold=True, color='C00000' if conflicto else '000000'))
             ws.row_dimensions[fila].height = 34
@@ -5516,7 +5571,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
         fila += 1
         for texto, relleno in (("Perforación (color de la máquina)", None), ("I / D = instalación / desmovilización", None),
-                               ("En curso (Perforando / Preinicio actual)", curso_fill), ("⚠ No podrá ingresar (conflicto)", conflicto_fill)):
+                               ("(M) = punto del plan manual", None),
+                               ("En curso (Perforando / Preinicio actual)", curso_fill)):
             celda = ws.cell(fila, 1, texto)
             celda.font = Font(size=9)
             if relleno:
@@ -5533,7 +5589,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         máquina, compromisos actuales, rendimiento de 15 días, zonas cargadas, observaciones y,
         si se pasan, hojas extra (ej. conflictos del plan manual)."""
         from openpyxl.styles import Font, PatternFill, Alignment
-        columnas = ['N', 'Mes', 'Horizonte', 'Maquina', 'Secuencia_Maquina', 'Orden_Manual', 'Plataforma', 'Identificador',
+        columnas = ['N', 'Mes', 'Horizonte', 'Maquina', 'Origen', 'Secuencia_Maquina', 'Orden_Manual', 'Plataforma', 'Identificador',
                     'Status_DDH', 'ESTE', 'NORTE', 'ELEV', 'LENGTH_m', 'Rendimiento_m_dia', 'Desde_Plataforma', 'Distancia_m',
                     'Dias_Instalacion', 'Dias_Perforacion', 'Dias_Desmovilizacion', 'Dias_Totales',
                     'Fecha_Inicio', 'Fecha_Fin', 'Espera_dias', 'Motivo_Espera', 'Conflicto', 'Motivo_Conflicto',
@@ -5668,7 +5724,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 'compromisos': compromisos, 'sin_coordenadas': sin_coordenadas, 'catalogo': catalogo, 'avisos': avisos,
                 'carpeta': getattr(self, 'ruta_plan', os.path.dirname(self.ruta_ctrl_proceso))}
 
-    def _entregar_plan(self, plan, estado_compromisos, datos, avisos, prefijo, titulo, extras=None):
+    def _entregar_plan(self, plan, estado_compromisos, datos, avisos, prefijo, titulo, extras=None, mensaje_extra="",
+                       advertir=False):
         """Guarda Excel (+ PNG), muestra el resumen y abre el ploteo interactivo."""
         nombre = f"{prefijo}_{plan['Fecha_Inicio'].min():%Y-%m-%d}.xlsx"
         ruta, _ = QFileDialog.getSaveFileName(self, f"Guardar {titulo}", os.path.join(datos['carpeta'], nombre),
@@ -5683,7 +5740,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                  f"{plan['Fecha_Inicio'].min():%d/%m/%Y} a {plan['Fecha_Fin'].max():%d/%m/%Y}\n"
                  + " | ".join(f"{m}: {n}" for m, n in resumen.items()))
         self.Mensajes.setText(texto)
-        mensaje = texto + (f"\n\nExportado a:\n{ruta}" if ruta else "")
+        mensaje = texto + (f"\n\nExportado a:\n{ruta}" if ruta else "") + (f"\n\n{mensaje_extra}" if mensaje_extra else "")
         conflictos = plan[plan['Conflicto']] if 'Conflicto' in plan else plan.iloc[0:0]
         if not conflictos.empty:
             mensaje += f"\n\n⚠ {len(conflictos)} PUNTOS NO PODRÁN INGRESAR EN LA FECHA PLANIFICADA:"
@@ -5696,7 +5753,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         todos_avisos = avisos + datos['zonas']['avisos']
         if todos_avisos:
             mensaje += "\n\nObservaciones:\n- " + "\n- ".join(todos_avisos[:12])
-        if conflictos.empty:
+        if conflictos.empty and not advertir:
             QMessageBox.information(self, titulo, mensaje)
         else:
             QMessageBox.warning(self, titulo, mensaje)
@@ -5746,12 +5803,13 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 return
             plan_base = getattr(self, 'plan_perforacion', None)
             self._exportar_plantilla_plan_manual(ruta, datos['pendientes'], datos['catalogo'], estado_compromisos, rates, plan_base)
-            origen = ("prellenada con la propuesta automática" if plan_base is not None
-                      else "con los puntos pendientes sin máquina (genere antes el plan automático para prellenarla)")
+            origen = ("Las columnas Ref_* muestran la propuesta automática como referencia." if plan_base is not None
+                      else "Genere antes el plan automático si quiere ver su propuesta en las columnas Ref_*.")
             QMessageBox.information(self, "Plantilla de plan manual",
-                                    f"Plantilla guardada en:\n{ruta}\n\nHoja Plan_Manual {origen}.\n"
-                                    "Complete Máquina y Orden (Fecha_Inicio y Rendimiento son opcionales) y cárguela "
-                                    "con 'Cargar Plan Manual'.")
+                                    f"Plantilla guardada en:\n{ruta}\n\n{origen}\n"
+                                    "Complete Máquina y Orden SOLO en los puntos que quiere fijar (Fecha_Inicio y "
+                                    "Rendimiento son opcionales) y cárguela con 'Cargar Plan Manual': el resto del plan "
+                                    "se completa automáticamente.")
             self.Mensajes.setText("Plantilla de plan manual exportada")
         except Exception as e:
             traceback.print_exc()
@@ -5759,8 +5817,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
             self.Mensajes.setText("Ocurrio algun error al generar la plantilla")
 
     def CargarPlanManualExcel(self):
-        """Botón CargarPlanManual: lee el plan armado a mano, recalcula fechas con el rendimiento,
-        avisa qué puntos no se podrán ingresar (y por qué) y exporta Excel + Gantt + ploteo."""
+        """Botón CargarPlanManual: toma los puntos del plan manual como los próximos movimientos de
+        cada máquina, descarta (y explica) los que no se pueden ingresar, completa el resto de
+        puntos pendientes con el plan automático y exporta Excel + Gantt + ploteo."""
         self.Mensajes.clear()
         try:
             datos = self._preparar_datos_plan()
@@ -5773,28 +5832,27 @@ class MyApp(QMainWindow, Ui_MainWindow):
             if manual.empty:
                 QMessageBox.warning(self, "Plan manual", "La hoja Plan_Manual no tiene filas con Máquina y Plataforma.")
                 return
-            plan, estado_compromisos, rechazados, avisos_plan = self._aplicar_plan_manual(
-                manual, datos['catalogo'], datos['compromisos'], datos['rendimiento'], datos['zonas'], datos['corte'])
+            plan, estado_compromisos, no_considerados, avisos_plan = self._aplicar_plan_manual(
+                manual, datos['catalogo'], datos['pendientes'], datos['compromisos'], datos['rendimiento'],
+                datos['zonas'], datos['corte'])
             avisos = datos['avisos'] + avisos_plan
-            for _, r in rechazados.iterrows():
-                avisos.append(f"Fila {r['Fila_Excel']} ({r['Plataforma']}, {r['Maquina']}) no se programó: {r['Motivo']}.")
             if plan.empty:
                 QMessageBox.warning(self, "Plan manual", "\n".join(avisos) or "No se pudo programar ningún punto.")
                 return
-            no_planificados = datos['pendientes'][~datos['pendientes']['Plataforma'].str.upper().str.replace(" ", "")
-                                                  .isin(plan['Plataforma'].str.upper().str.replace(" ", ""))]
-            if not no_planificados.empty:
-                avisos.append(f"{len(no_planificados)} puntos pendientes no están en el plan manual (hoja No_Planificados).")
             for _, r in plan[plan['Ajuste'] != ""].iterrows():
                 avisos.append(f"{r['Plataforma']}: {r['Ajuste']}")
-            conflictos = plan[plan['Conflicto'] | (plan['Ajuste'] != "")][
-                ['N', 'Maquina', 'Plataforma', 'Fecha_Inicio', 'Fecha_Fin', 'Motivo_Conflicto', 'Fecha_Sugerida', 'Ajuste']].copy()
-            for col in ('Fecha_Inicio', 'Fecha_Fin', 'Fecha_Sugerida'):
-                conflictos[col] = pd.to_datetime(conflictos[col]).dt.date
+            n_manual = int((plan['Origen'] == "Manual").sum())
+            extra = (f"Puntos manuales considerados: {n_manual} | completados automáticamente: {len(plan) - n_manual}")
+            if not no_considerados.empty:
+                extra += f"\n\n⚠ {len(no_considerados)} PUNTOS MANUALES NO CONSIDERADOS:"
+                for _, r in no_considerados.head(10).iterrows():
+                    extra += f"\n- {r['Plataforma']} ({r['Maquina']}): {r['Motivo']} → {r['Resultado']}"
+                if len(no_considerados) > 10:
+                    extra += f"\n... y {len(no_considerados) - 10} más (ver hoja Manual_No_Considerado)."
             self.plan_manual = plan
-            extras = {'Conflictos': conflictos, 'Filas_Rechazadas': rechazados,
-                      'No_Planificados': no_planificados.drop(columns=['LENGTH_estimado'], errors='ignore')}
-            self._entregar_plan(plan, estado_compromisos, datos, avisos, "Plan_Manual_Validado", "Plan Manual", extras)
+            self._entregar_plan(plan, estado_compromisos, datos, avisos, "Plan_Manual_Completado",
+                                "Plan Manual + Automático", {'Manual_No_Considerado': no_considerados},
+                                mensaje_extra=extra, advertir=not no_considerados.empty)
         except Exception as e:
             traceback.print_exc()
             QMessageBox.critical(self, "Error en el plan manual", f"{type(e).__name__}: {e}")
