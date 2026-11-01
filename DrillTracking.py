@@ -1226,6 +1226,19 @@ class MyApp(QMainWindow, Ui_MainWindow):
             return (fecha + pd.DateOffset(months=1)).to_period("M")
         return fecha.to_period("M")
 
+    @staticmethod
+    def _mes_plan(fecha):
+        """Mes de PLANIFICACIÓN (distinto del 20-19 de los reportes): cada mes va del 26 del mes anterior al
+        25 del mes (Noviembre = 26/10 a 25/11), EXCEPTO Diciembre, que va del 26/11 al 31/12 (no pasa a
+        Enero) y Enero, que va del 01/01 al 25/01. Devuelve un pd.Period mensual. Un punto cuenta en el mes
+        en que EMPIEZA (su fecha de inicio)."""
+        f = pd.Timestamp(fecha)
+        if f.month == 12:
+            return pd.Period(year=f.year, month=12, freq="M")
+        if f.day >= 26:
+            return (f + pd.DateOffset(months=1)).to_period("M")
+        return f.to_period("M")
+
     def _distribuir_en_buckets(self, desde, hasta, ancho_bucket=100, num_buckets=5):
         """Reparte los metros perforados en un turno (de `desde` a `hasta`, metraje
         ACUMULADO de esa broca específica) entre los tramos de `ancho_bucket` metros de su
@@ -5177,12 +5190,12 @@ class MyApp(QMainWindow, Ui_MainWindow):
         }
 
     def _completar_columnas_plan(self, plan):
-        """Numera el plan por fecha de inicio y agrega Mes (operativo, 20 -> 19), Horizonte y la
+        """Numera el plan por fecha de inicio y agrega Mes (de planificación, 26 -> 25, ver _mes_plan), Horizonte y la
         secuencia de cada máquina."""
         plan = plan.sort_values(['Fecha_Inicio', 'Maquina']).reset_index(drop=True)
         plan.insert(0, 'N', np.arange(1, len(plan) + 1))
         plan['Secuencia_Maquina'] = plan.groupby('Maquina').cumcount() + 1
-        periodo = plan['Fecha_Inicio'].map(self._mes_personalizado)
+        periodo = plan['Fecha_Inicio'].map(self._mes_plan)
         indice_mes = periodo.map(lambda p: p.ordinal) - periodo.min().ordinal
         plan.insert(1, 'Mes', periodo.map(lambda p: f"{MESES_ES[p.month - 1]} {p.year}"))
         plan.insert(2, 'Horizonte', np.select([indice_mes <= 0, indice_mes <= 2], ["Mes 1", "Meses 2-3"], "Posterior"))
@@ -5700,11 +5713,15 @@ class MyApp(QMainWindow, Ui_MainWindow):
             celda.fill = PatternFill('solid', fgColor='1F4E78')
         cabecera = PatternFill('solid', fgColor='1F4E78')
         domingo = PatternFill('solid', fgColor='D9D9D9')
-        for (anio, mes), grupo in pd.Series(dias, index=dias).groupby([dias.year, dias.month]):
-            c1, c2 = col_de(grupo.iloc[0]), col_de(grupo.iloc[-1])
+        # Encabezado de meses = meses de PLANIFICACIÓN (26 -> 25), los mismos con que se cuentan los puntos del plan
+        periodos_dia = pd.Series([self._mes_plan(d) for d in dias], index=dias)
+        grupos_mes = []
+        for periodo, grupo in periodos_dia.groupby(periodos_dia, sort=False):
+            c1, c2 = col_de(grupo.index[0]), col_de(grupo.index[-1])
+            grupos_mes.append((periodo, c1, c2))
             if c2 > c1:
                 ws.merge_cells(start_row=2, start_column=c1, end_row=2, end_column=c2)
-            celda = ws.cell(2, c1, f"{MESES_ES[mes - 1]} {anio}")
+            celda = ws.cell(2, c1, f"{MESES_ES[periodo.month - 1]} {periodo.year}  ({grupo.index[0]:%d/%m} - {grupo.index[-1]:%d/%m})")
             celda.font, celda.fill, celda.alignment = Font(bold=True, color='FFFFFF'), cabecera, centrado
         letras = "LMMJVSD"
         for dia in dias:
@@ -5775,6 +5792,21 @@ class MyApp(QMainWindow, Ui_MainWindow):
             ws.row_dimensions[fila].height = 34
             fila += 1
 
+        # Puntos que EMPIEZAN en cada mes (así se cuentan en Plan_Completo / Resumen_Mensual): las barras que cruzan de un
+        # mes a otro se cuentan solo en el mes en que inician.
+        ws.cell(fila, 1, "Puntos que inician en el mes").font = Font(bold=True, size=9)
+        iniciados = plan['Fecha_Inicio'].map(self._mes_plan)
+        for periodo, c1, c2 in grupos_mes:
+            n = int((iniciados == periodo).sum())
+            for c in range(c1, c2 + 1):
+                ws.cell(fila, c).fill = PatternFill('solid', fgColor='DDEBF7')
+                ws.cell(fila, c).border = borde
+            if c2 > c1:
+                ws.merge_cells(start_row=fila, start_column=c1, end_row=fila, end_column=c2)
+            celda = ws.cell(fila, c1, n)
+            celda.font, celda.alignment = Font(bold=True), centrado
+        fila += 1
+
         ventanas = sorted(zonas['sem'] + zonas['perfo'], key=lambda z: z['inicio'])
         if ventanas:
             fila += 1
@@ -5842,12 +5874,12 @@ class MyApp(QMainWindow, Ui_MainWindow):
         máquina tiene en curso (Perforando / Preinicio), que se muestra en el mes en que termina."""
         columnas = ['Plataforma', 'ESTE', 'NORTE', 'Maquina', 'Mes', 'Periodo', 'Desde_ESTE', 'Desde_NORTE', 'Desde_Plataforma']
         filas = [{'Plataforma': r.Plataforma, 'ESTE': r.ESTE, 'NORTE': r.NORTE, 'Maquina': r.Maquina, 'Mes': r.Mes,
-                  'Periodo': self._mes_personalizado(r.Fecha_Inicio), 'Desde_ESTE': r.Desde_ESTE, 'Desde_NORTE': r.Desde_NORTE,
+                  'Periodo': self._mes_plan(r.Fecha_Inicio), 'Desde_ESTE': r.Desde_ESTE, 'Desde_NORTE': r.Desde_NORTE,
                   'Desde_Plataforma': r.Desde_Plataforma}
                  for r in plan.itertuples()]
         if compromisos is not None and not compromisos.empty:
             for r in compromisos.dropna(subset=['ESTE', 'NORTE']).itertuples():
-                periodo = self._mes_personalizado(pd.Timestamp(r.Fecha_Liberacion))
+                periodo = self._mes_plan(pd.Timestamp(r.Fecha_Liberacion))
                 filas.append({'Plataforma': r.Plataforma, 'ESTE': r.ESTE, 'NORTE': r.NORTE, 'Maquina': r.Maquina,
                               'Mes': f"{MESES_ES[periodo.month - 1]} {periodo.year}", 'Periodo': periodo})
         return pd.DataFrame(filas, columns=columnas).sort_values('Periodo', kind='stable').reset_index(drop=True)
@@ -5992,7 +6024,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
         observaciones = pd.DataFrame({'Observacion': avisos + zonas['avisos'] + [
             f"Días por punto = {PLAN_DIAS_INSTALACION} instalación + ceil(LENGTH / rendimiento) + {PLAN_DIAS_DESMOVILIZACION} desmovilización.",
             f"Rendimiento = metros de los últimos {PLAN_DIAS_RENDIMIENTO} días / días reportados en esa ventana.",
-            "Mes = mes operativo del proyecto (del día 20 al 19; Diciembre hasta el 31), según la fecha de inicio del punto.",
+            "Mes de planificación: del 26 del mes anterior al 25 (Noviembre = 26/10-25/11; Diciembre = 26/11-31/12; Enero = 01/01-25/01); "
+            "cada punto cuenta en el mes en que EMPIEZA su perforación (las columnas del Gantt se agrupan igual).",
             "SEM / PERFO bloquean el punto solo entre sus fechas; fuera de ellas solo aplica la restricción de vías.",
             f"Puntos a <= {PLAN_BUFFER_VIAS_M} m de una vía la cierran: no puede haber otra máquina en la misma vía "
             f"a <= {PLAN_TRAMO_VIA_M} m al mismo tiempo.",
