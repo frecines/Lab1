@@ -901,8 +901,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     else:
                         raise Exception("No se han cargado los reportes previos (self.df no existe).")
     
-                    self.BD_Union["INICIO.1"] = pd.to_datetime(self.BD_Union["INICIO.1"])
-                    self.BD_Union["FIN.1"] = pd.to_datetime(self.BD_Union["FIN.1"])
+                    self.BD_Union["INICIO.1"] = self._parse_fechas_control(self.BD_Union["INICIO.1"])
+                    self.BD_Union["FIN.1"] = self._parse_fechas_control(self.BD_Union["FIN.1"])
                     
                     # Calculamos la cantidad de días del rango (incluyente)
                     self.BD_Union["Dias_Rango"] = (self.BD_Union["FIN.1"] - self.BD_Union["INICIO.1"]).dt.days + 1
@@ -1942,6 +1942,19 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     QMessageBox.critical(self, "Error de Procesamiento", mensaje)
                     self.Mensajes.setText(mensaje)
         
+    @staticmethod
+    def _parse_fechas_control(valores):
+        """Fechas de Control de Proceso (INICIO.1 / FIN.1) a datetime. Las que vienen como TEXTO
+        (ej. '14/10/26') se leen con el DÍA primero (dd/mm/aa): sin esto pandas leería '03/11/26'
+        como 11 de marzo. Las que ya son fecha de Excel se respetan. Lo no interpretable -> NaT."""
+        def convertir(v):
+            if isinstance(v, str):
+                return pd.to_datetime(v.strip(), dayfirst=True, errors='coerce')
+            return pd.to_datetime(v, errors='coerce')
+        if isinstance(valores, pd.Series):
+            return valores.map(convertir).astype('datetime64[ns]')
+        return convertir(valores)
+
     def _detectar_sondajes_externos(self, file_path):
         """Sondajes EJECUTADOS en Control de Proceso que no figuran en los reportes de turno
         digitales porque los perforó otra área (ej. WK-26 / GTC26-05: la perforó Hidrogeología
@@ -1953,7 +1966,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         hoja DDH). Fechas = INICIO.1 / FIN.1 de Control de Proceso (los mismos que usa el
         'Metraje Descontado'); sin fechas, se usa la fecha de corte de los reportes."""
         columnas = ['Identificador', 'Plataforma', 'Sondaje', 'Maquina', 'Metros', 'Fecha_Inicio', 'Fecha_Fin',
-                    'Fuente_Fecha', 'Comentario']
+                    'Fuente_Fecha', 'Comentario', 'Largo_DDH']
         bd = self.BD_Union_total
         candidatos = bd[(bd['Estado'] == 'Ejecutado') & bd['Avance_Actual'].isna() & bd['Sondaje'].notna()]
         prefijos = tuple(p.upper() for p in PREFIJOS_SONDAJE_PROYECTO)
@@ -1978,7 +1991,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
             metros = float(ejecutado) if pd.notna(ejecutado) and ejecutado > 0 else float(r['LENGTH'] or 0)
             if metros <= 0:
                 continue
-            ini, fin = pd.to_datetime(r.get('INICIO.1'), errors='coerce'), pd.to_datetime(r.get('FIN.1'), errors='coerce')
+            ini, fin = self._parse_fechas_control(r.get('INICIO.1')), self._parse_fechas_control(r.get('FIN.1'))
             if pd.notna(ini) and pd.notna(fin):
                 ini, fin, fuente = min(ini, fin), max(ini, fin), "INICIO.1 / FIN.1 de Control de Proceso"
             elif pd.notna(ini) or pd.notna(fin):
@@ -1992,7 +2005,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
             comentario = cp['COMENTARIOS'].get(clave) if clave in cp.index else ""
             filas.append({'Identificador': r['Identificador'], 'Plataforma': r['Plataforma'], 'Sondaje': r['Sondaje'],
                           'Maquina': maquina, 'Metros': metros, 'Fecha_Inicio': ini.normalize(), 'Fecha_Fin': fin.normalize(),
-                          'Fuente_Fecha': fuente, 'Comentario': "" if pd.isna(comentario) else str(comentario)})
+                          'Fuente_Fecha': fuente, 'Comentario': "" if pd.isna(comentario) else str(comentario),
+                          'Largo_DDH': float(r['LENGTH'] or 0)})
         return pd.DataFrame(filas, columns=columnas)
 
     def _incorporar_sondajes_externos(self, file_path):
@@ -2013,7 +2027,11 @@ class MyApp(QMainWindow, Ui_MainWindow):
             bd.loc[filtro, 'Metro_Faltante'] = (bd.loc[filtro, 'LENGTH'] - r['Metros']).clip(lower=0)
             rango = (f"{r['Fecha_Inicio']:%d/%m/%Y}" if r['Fecha_Inicio'] == r['Fecha_Fin']
                      else f"{r['Fecha_Inicio']:%d/%m/%Y} a {r['Fecha_Fin']:%d/%m/%Y}")
-            lineas.append(f"- {r['Plataforma']} / {r['Sondaje']}: {r['Metros']:,.0f} m ({r['Maquina']}) — {rango}")
+            linea = f"- {r['Plataforma']} / {r['Sondaje']}: {r['Metros']:,.0f} m ({r['Maquina']}) — {rango}"
+            if abs(r['Metros'] - r['Largo_DDH']) > 0.01:
+                linea += (f"\n  ⚠ PROF. EJECUTADA de Control de Proceso ({r['Metros']:,.0f} m) difiere del LENGTH de la hoja "
+                          f"DDH ({r['Largo_DDH']:,.0f} m): se usó PROF. EJECUTADA.")
+            lineas.append(linea)
         total = self.sondajes_externos['Metros'].sum()
         texto = (f"Se sumaron {total:,.0f} m de sondajes sin reporte digital (perforados por otra área, tomados de "
                  f"Control de Proceso):\n" + "\n".join(lineas))
