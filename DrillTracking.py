@@ -47,6 +47,11 @@ except ImportError:
 # faltan componentes y se cierra (hay que entregar una versión actualizada).
 FECHA_LICENCIA = datetime(2027, 12, 31).date()
 
+# Los sondajes del proyecto se llaman MR##### (ver reportes de turno). Un sondaje ejecutado en
+# Control de Proceso con otro prefijo (ej. GTC26-05, perforado por otra área) no figura en los
+# reportes digitales: sus metros se toman de Control de Proceso (ver _detectar_sondajes_externos).
+PREFIJOS_SONDAJE_PROYECTO = ("MR",)
+
 OBJETIVO_DIARIO_M = 35  # Metros objetivo por máquina por día
 META_TOTAL_PROYECTO = 28000  # Meta contractual total del proyecto, en metros
 STALE_DAYS = 10  # Días sin reportar avance, sin señales en comentarios, para considerar retirada
@@ -934,6 +939,11 @@ class MyApp(QMainWindow, Ui_MainWindow):
                         .reset_index()
                     )
                     real_diario.rename(columns={"Avance Turno": "Avance_Real_Bruto"}, inplace=True)
+
+                    # Metros de sondajes sin reporte digital (perforados por otra área, ej. GTC26-05):
+                    # se suman al avance del día en que se perforaron (según Control de Proceso).
+                    real_diario = real_diario.merge(self._avance_externo_diario(), on="Fecha", how="outer").fillna(0)
+                    real_diario["Avance_Real_Bruto"] = real_diario["Avance_Real_Bruto"] + real_diario["Avance_Externo"]
                     
                     # 4. Unir Avance Real con Descuentos y calcular el Neto
                     real_diario = real_diario.merge(df_descuentos_diarios, on="Fecha", how="left").fillna(0)
@@ -1890,6 +1900,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     self.BD_Union_total = pd.merge(self.BD_Union, resumen, on="Sondaje", how="left")
                     self.BD_Union_total["Metro_Faltante"] = (self.BD_Union_total["LENGTH"] - self.BD_Union_total["Avance_Actual"]).clip(lower=0)
                     self.BD_Union_total["Estado"] = self.BD_Union_total["Status"].fillna("Programado")
+                    aviso_externos = self._incorporar_sondajes_externos(file_path)
                     
                     # 2.1 Cálculos de Proyección
                     avance_diario = self.df.groupby(["Sondaje", "Fecha"])["Avance Turno"].sum().reset_index()
@@ -1905,8 +1916,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     df_plot["Proyeccion_fmt"] = df_plot["Proyeccion_Dias"].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
                     df_plot["Sondaje_fmt"] = df_plot["Sondaje"].fillna("-").astype(str)
                     df_plot["Maquina_fmt"] = df_plot["Maquina"].fillna("S/M").astype(str)
-                    QMessageBox.information(self, "Éxito", "Control de proceso (BD_Union) cargado y vinculado correctamente.")
-                    self.Mensajes.setText("Se cargo el Archivo con el control de procesos \nrevisar que sea el actualizado")
+                    QMessageBox.information(self, "Éxito", "Control de proceso (BD_Union) cargado y vinculado correctamente."
+                                            + (f"\n\n{aviso_externos}" if aviso_externos else ""))
+                    self.Mensajes.setText("Se cargo el Archivo con el control de procesos \nrevisar que sea el actualizado"
+                                          + (f"\n{aviso_externos.splitlines()[0]}" if aviso_externos else ""))
                     self.PlanPerf.setEnabled(True)
                     self.ruta_ctrl_proceso = file_path  # el planificador relee la hoja DDH (columnas C y W)
                     self.GenerarPlan.setEnabled(hasattr(self, 'zonas_plan'))
@@ -1929,6 +1942,99 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     QMessageBox.critical(self, "Error de Procesamiento", mensaje)
                     self.Mensajes.setText(mensaje)
         
+    def _detectar_sondajes_externos(self, file_path):
+        """Sondajes EJECUTADOS en Control de Proceso que no figuran en los reportes de turno
+        digitales porque los perforó otra área (ej. WK-26 / GTC26-05: la perforó Hidrogeología
+        hasta 400 m y el proyecto cubre los 151 m presupuestados con la máquina H600). Criterio,
+        los tres a la vez: Status Ejecutado en la hoja DDH, sin ningún avance en los reportes y
+        nombre de sondaje que NO empieza con un prefijo del proyecto (PREFIJOS_SONDAJE_PROYECTO).
+        No basta "ejecutado y sin reporte": con una carpeta de reportes incompleta se sumarían
+        metros de más. Metros = 'PROF. EJECUTADA' de Control de Proceso (si no, el LENGTH de la
+        hoja DDH). Fechas = INICIO.1 / FIN.1 de Control de Proceso (los mismos que usa el
+        'Metraje Descontado'); sin fechas, se usa la fecha de corte de los reportes."""
+        columnas = ['Identificador', 'Plataforma', 'Sondaje', 'Maquina', 'Metros', 'Fecha_Inicio', 'Fecha_Fin',
+                    'Fuente_Fecha', 'Comentario']
+        bd = self.BD_Union_total
+        candidatos = bd[(bd['Estado'] == 'Ejecutado') & bd['Avance_Actual'].isna() & bd['Sondaje'].notna()]
+        prefijos = tuple(p.upper() for p in PREFIJOS_SONDAJE_PROYECTO)
+        candidatos = candidatos[~candidatos['Sondaje'].astype(str).str.strip().str.upper().str.startswith(prefijos)]
+        if candidatos.empty:
+            return pd.DataFrame(columns=columnas)
+
+        try:
+            cp = pd.read_excel(file_path, sheet_name="Control de Proceso", header=2,
+                               usecols=lambda c: str(c).strip() in ("Identificador", "PROF. EJECUTADA", "COMENTARIOS", "MAQUINA"))
+            cp['_id'] = cp['Identificador'].astype(str).str.strip()
+            cp = cp.drop_duplicates('_id').set_index('_id')
+        except Exception as e:
+            print(f"No se pudo leer PROF. EJECUTADA / COMENTARIOS de Control de Proceso: {e}")
+            cp = pd.DataFrame(columns=['PROF. EJECUTADA', 'COMENTARIOS', 'MAQUINA'])
+
+        fecha_corte = pd.to_datetime(self.df['Fecha'], errors='coerce').max().normalize()
+        filas = []
+        for _, r in candidatos.iterrows():
+            clave = str(r['Identificador']).strip()
+            ejecutado = pd.to_numeric(cp['PROF. EJECUTADA'].get(clave), errors='coerce') if clave in cp.index else np.nan
+            metros = float(ejecutado) if pd.notna(ejecutado) and ejecutado > 0 else float(r['LENGTH'] or 0)
+            if metros <= 0:
+                continue
+            ini, fin = pd.to_datetime(r.get('INICIO.1'), errors='coerce'), pd.to_datetime(r.get('FIN.1'), errors='coerce')
+            if pd.notna(ini) and pd.notna(fin):
+                ini, fin, fuente = min(ini, fin), max(ini, fin), "INICIO.1 / FIN.1 de Control de Proceso"
+            elif pd.notna(ini) or pd.notna(fin):
+                ini = fin = ini if pd.notna(ini) else fin
+                fuente = "Fecha única de Control de Proceso"
+            else:
+                ini = fin = fecha_corte
+                fuente = "Fecha de corte de los reportes (Control de Proceso no tiene fechas)"
+            maquina = str(cp['MAQUINA'].get(clave) or "").strip() if clave in cp.index else ""
+            maquina = maquina if maquina and maquina.lower() != "nan" else (str(r['Maquina']) if pd.notna(r.get('Maquina')) else "S/M")
+            comentario = cp['COMENTARIOS'].get(clave) if clave in cp.index else ""
+            filas.append({'Identificador': r['Identificador'], 'Plataforma': r['Plataforma'], 'Sondaje': r['Sondaje'],
+                          'Maquina': maquina, 'Metros': metros, 'Fecha_Inicio': ini.normalize(), 'Fecha_Fin': fin.normalize(),
+                          'Fuente_Fecha': fuente, 'Comentario': "" if pd.isna(comentario) else str(comentario)})
+        return pd.DataFrame(filas, columns=columnas)
+
+    def _incorporar_sondajes_externos(self, file_path):
+        """Detecta los sondajes sin reporte digital (ver _detectar_sondajes_externos) y los
+        incorpora a BD_Union_total como perforados (Avance_Actual = metros, Metro_Faltante = 0),
+        para que el plano, el dashboard, el Word y el planificador los den por ejecutados. Los
+        metros por día para la Curva S los entrega _avance_externo_diario. Devuelve un texto
+        para el usuario (vacío si no hay ninguno)."""
+        self.sondajes_externos = self._detectar_sondajes_externos(file_path)
+        if self.sondajes_externos.empty:
+            return ""
+        bd = self.BD_Union_total
+        lineas = []
+        for _, r in self.sondajes_externos.iterrows():
+            filtro = (bd['Identificador'] == r['Identificador']) & (bd['Sondaje'] == r['Sondaje'])
+            bd.loc[filtro, 'Avance_Actual'] = r['Metros']
+            bd.loc[filtro, 'Maquina'] = bd.loc[filtro, 'Maquina'].fillna(r['Maquina'])
+            bd.loc[filtro, 'Metro_Faltante'] = (bd.loc[filtro, 'LENGTH'] - r['Metros']).clip(lower=0)
+            rango = (f"{r['Fecha_Inicio']:%d/%m/%Y}" if r['Fecha_Inicio'] == r['Fecha_Fin']
+                     else f"{r['Fecha_Inicio']:%d/%m/%Y} a {r['Fecha_Fin']:%d/%m/%Y}")
+            lineas.append(f"- {r['Plataforma']} / {r['Sondaje']}: {r['Metros']:,.0f} m ({r['Maquina']}) — {rango}")
+        total = self.sondajes_externos['Metros'].sum()
+        texto = (f"Se sumaron {total:,.0f} m de sondajes sin reporte digital (perforados por otra área, tomados de "
+                 f"Control de Proceso):\n" + "\n".join(lineas))
+        if self.sondajes_externos['Fuente_Fecha'].str.startswith("Fecha de corte").any():
+            texto += ("\nSin fechas en Control de Proceso se contaron en la fecha de corte: para ubicarlos en su "
+                      "periodo complete INICIO.1 / FIN.1 de esa fila.")
+        return texto
+
+    def _avance_externo_diario(self):
+        """Metros por día de los sondajes sin reporte digital (reparto uniforme entre su fecha de
+        inicio y fin). Devuelve DataFrame Fecha / Avance_Externo (vacío si no hay)."""
+        vacio = pd.DataFrame({'Fecha': pd.Series(dtype='datetime64[ns]'), 'Avance_Externo': pd.Series(dtype=float)})
+        externos = getattr(self, 'sondajes_externos', None)
+        if externos is None or externos.empty:
+            return vacio
+        partes = []
+        for _, r in externos.iterrows():
+            fechas = pd.date_range(r['Fecha_Inicio'], r['Fecha_Fin'])
+            partes.append(pd.DataFrame({'Fecha': fechas, 'Avance_Externo': r['Metros'] / len(fechas)}))
+        return pd.concat(partes).groupby('Fecha', as_index=False)['Avance_Externo'].sum()
+
     def LoadTopo(self):
             self.Mensajes.clear()
             """
@@ -4832,6 +4938,11 @@ class MyApp(QMainWindow, Ui_MainWindow):
             mediana = mediana if pd.notna(mediana) else 300.0
             pendientes.loc[pendientes['LENGTH_estimado'], 'LENGTH'] = mediana
             avisos.append(f"{int(pendientes['LENGTH_estimado'].sum())} plataformas sin LENGTH: se asumió {mediana:.0f} m (mediana).")
+
+        externos = getattr(self, 'sondajes_externos', None)
+        if externos is not None and not externos.empty:
+            avisos.append("Ejecutados sin reporte digital (según Control de Proceso, no se planifican): " + "; ".join(
+                f"{r['Plataforma']} / {r['Sondaje']} ({r['Metros']:,.0f} m, {r['Maquina']})" for _, r in externos.iterrows()))
 
         # Catálogo de TODAS las plataformas (una fila por plataforma) con su situación, para
         # validar el plan manual: ahí el usuario puede escribir cualquier plataforma de la hoja.
