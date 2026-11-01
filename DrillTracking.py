@@ -96,6 +96,11 @@ PLAN_TRAMO_VIA_M = 300
 PLAN_DIAS_INSTALACION = 1
 PLAN_DIAS_DESMOVILIZACION = 1
 PLAN_DIAS_RENDIMIENTO = 15  # Ventana (días hasta la fecha de corte) para el rendimiento de cada máquina
+# Un rendimiento de la ventana solo es confiable si la máquina tuvo suficientes datos en ella. Una máquina
+# recién instalada (ej. YN-1800: 6 días reportados y 2 m en un solo día) daría ~0.3 m/día y alargaría todo
+# su plan: en ese caso se usa el promedio (mediana) de las demás máquinas, igual que las que no tienen reportes.
+PLAN_MIN_DIAS_REPORTADOS = 10  # días con reporte dentro de la ventana
+PLAN_MIN_DIAS_CON_AVANCE = 5   # días con metros > 0 dentro de la ventana (y, en su historia, para usar su promedio histórico)
 # Progress (material volado) que NO se mina en el mes es una ventana de oportunidad: para elegir
 # el punto "más cercano" su distancia se multiplica por este factor (0.8 = se ve un 20% más cerca).
 PLAN_FACTOR_PROGRESS = 0.8
@@ -4991,7 +4996,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
     def _rendimiento_maquinas(self, dias=PLAN_DIAS_RENDIMIENTO):
         """Rendimiento de cada máquina en m/día = metros perforados en los últimos `dias` días
         hasta la fecha de corte (última fecha de los reportes) / días que reportó en esa ventana.
-        Sin avance en la ventana -> su promedio histórico; sin historia -> mediana de las demás.
+        Solo se usa si hay datos suficientes en la ventana (PLAN_MIN_DIAS_REPORTADOS días con
+        reporte y PLAN_MIN_DIAS_CON_AVANCE con metros); si no, su promedio histórico cuando tiene
+        historia suficiente (al menos `dias` días con metros) o, si es una máquina nueva, la
+        mediana de las máquinas con dato propio. 'Confiable' marca las que tienen dato propio.
         Devuelve (DataFrame, fecha_corte)."""
         df = self.df[['Fecha', 'Maquina', 'Avance Turno']].copy()
         df['Fecha'] = pd.to_datetime(df['Fecha'], errors='coerce').dt.normalize()
@@ -5002,23 +5010,29 @@ class MyApp(QMainWindow, Ui_MainWindow):
         desde = corte - pd.Timedelta(days=dias - 1)
         filas = []
         for maquina, grupo in df.groupby('Maquina'):
-            ventana = grupo[grupo['Fecha'] >= desde]
-            metros, dias_rep = ventana['Avance Turno'].sum(), ventana['Fecha'].nunique()
-            if dias_rep > 0 and metros > 0:
+            diario_ventana = grupo[grupo['Fecha'] >= desde].groupby('Fecha')['Avance Turno'].sum()
+            metros, dias_rep, dias_avance = diario_ventana.sum(), len(diario_ventana), int((diario_ventana > 0).sum())
+            diario_hist = grupo.groupby('Fecha')['Avance Turno'].sum()
+            dias_avance_hist = int((diario_hist > 0).sum())
+            rate, confiable = np.nan, True
+            if dias_rep >= PLAN_MIN_DIAS_REPORTADOS and dias_avance >= PLAN_MIN_DIAS_CON_AVANCE:
                 rate, fuente = metros / dias_rep, f"Últimos {dias} días"
+            elif dias_avance_hist >= max(dias, PLAN_MIN_DIAS_CON_AVANCE) and diario_hist.sum() > 0:
+                rate = diario_hist.mean()
+                fuente = (f"Promedio histórico (ventana con pocos datos: {dias_rep} días reportados, "
+                          f"{dias_avance} con avance)")
             else:
-                diario = grupo.groupby('Fecha')['Avance Turno'].sum()
-                rate = diario.mean() if len(diario) and diario.sum() > 0 else np.nan
-                fuente = "Promedio histórico (sin avance reciente)"
+                confiable = False
+                fuente = (f"Mediana de las demás máquinas (solo {dias_rep} días reportados y {dias_avance} con avance "
+                          f"en la ventana; {dias_avance_hist} con avance en total)")
             filas.append({'Maquina': str(maquina), f'Metros_{dias}d': round(metros, 1), 'Dias_Reportados': dias_rep,
-                          'Rendimiento_m_dia': rate, 'Fuente': fuente})
+                          'Dias_Con_Avance': dias_avance, 'Rendimiento_m_dia': rate, 'Confiable': confiable, 'Fuente': fuente})
         rend = pd.DataFrame(filas)
         if not rend.empty:
-            mediana = rend['Rendimiento_m_dia'].median()
-            mediana = mediana if pd.notna(mediana) else OBJETIVO_DIARIO_M
-            sin_dato = rend['Rendimiento_m_dia'].isna()
-            rend.loc[sin_dato, 'Rendimiento_m_dia'] = mediana
-            rend.loc[sin_dato, 'Fuente'] = "Mediana de las demás máquinas"
+            propios = rend.loc[rend['Confiable'], 'Rendimiento_m_dia']
+            mediana = propios.median() if not propios.empty else np.nan
+            mediana = float(mediana) if pd.notna(mediana) else float(OBJETIVO_DIARIO_M)
+            rend.loc[~rend['Confiable'], 'Rendimiento_m_dia'] = mediana
             rend['Rendimiento_m_dia'] = rend['Rendimiento_m_dia'].round(1)
         return rend, corte
 
@@ -5051,7 +5065,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
         """m/día de cada nombre de máquina (columna W o plan manual), emparejado con los nombres
         de los reportes de turno (ej. "YN-1500" -> "JINSHI YN-1500"). Sin reportes -> mediana."""
         rend_por_maquina = dict(zip(rendimiento['Maquina'], rendimiento['Rendimiento_m_dia']))
-        rate_defecto = float(rendimiento['Rendimiento_m_dia'].median()) if not rendimiento.empty else float(OBJETIVO_DIARIO_M)
+        propios = rendimiento.loc[rendimiento['Confiable'], 'Rendimiento_m_dia'] if 'Confiable' in rendimiento else rendimiento['Rendimiento_m_dia']
+        rate_defecto = float(propios.median()) if not propios.empty else float(OBJETIVO_DIARIO_M)
         nombres = sorted({str(n) for n in nombres if str(n).strip()})
         equivalencias = self._emparejar_nombres_maquina(nombres, list(rend_por_maquina))
         rates = {}
