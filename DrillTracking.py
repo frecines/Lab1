@@ -119,6 +119,10 @@ PLAN_STATUS_OCUPADO = ("ejecutado", "perforando", "preinicio")
 PLAN_STATUS_DESCARTADO = ("anulad", "cancelad", "descartad", "suspendid")
 # "Plataforma" = plataforma construida esperando máquina: se considera pendiente aunque ya tenga DDHID.
 PLAN_STATUS_PENDIENTE_EXTRA = ("plataforma",)
+# Planos mensuales (como el plano de programa del proyecto): color por mes calendario y forma por máquina.
+PLAN_COLORES_MES = {11: '#E0143C', 12: '#FFB000', 1: '#0033FF', 2: '#1E7B1E', 3: '#9B26B6', 4: '#00A6A6',
+                    5: '#8B4513', 6: '#FF69B4', 7: '#808000', 8: '#00BFFF', 9: '#A0522D', 10: '#000080'}
+PLAN_MARCADORES_MAQUINA = ['s', '^', 'D', 'v', 'P', 'h', 'X', 'p', '*', '<', '>', 'd']
 MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
             "Septiembre", "Octubre", "Noviembre", "Diciembre"]
 
@@ -5799,11 +5803,164 @@ class MyApp(QMainWindow, Ui_MainWindow):
         ws.freeze_panes = ws.cell(5, col0)
         ws.sheet_view.zoomScale = 85
 
-    def _exportar_plan_excel(self, ruta, plan, compromisos, rendimiento, sin_coordenadas, zonas, avisos, ruta_png=None, extras=None):
+    # ---------------------------------------------------------------- planos mensuales (topografía + puntos)
+    def _leer_topografia_planos(self):
+        """Líneas de la topografía importada (Carpeta Topografía) como lista de (puntos XY, color, ancho),
+        con el color de cada línea en el DXF (propio o de su capa): las curvas intermedias (blanco / negro /
+        gris) salen en gris fino y las de otro color (ej. las maestras en verde) conservan su color. Se
+        guarda en caché porque se dibuja en cada plano. Devuelve [] si no hay topografía."""
+        ruta = getattr(self, 'ruta_topo', None)
+        if not ruta or not os.path.isdir(ruta):
+            return []
+        archivos = sorted(f for f in os.listdir(ruta) if f.lower().endswith(".dxf"))
+        firma = (ruta, tuple((f, os.path.getmtime(os.path.join(ruta, f))) for f in archivos))
+        if getattr(self, '_cache_topo_planos', (None, None))[0] == firma:
+            return self._cache_topo_planos[1]
+        from ezdxf import colors as ezdxf_colors
+        lineas = []
+        for archivo in archivos:
+            try:
+                doc = ezdxf.readfile(os.path.join(ruta, archivo))
+            except Exception as e:
+                print(f"Error leyendo topografía {archivo}: {e}")
+                continue
+            color_capa = {}
+            for e in doc.modelspace():
+                tipo = e.dxftype()
+                if tipo == "LWPOLYLINE":
+                    pts = [(p[0], p[1]) for p in e.get_points()]
+                elif tipo == "POLYLINE":
+                    pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+                elif tipo == "LINE":
+                    pts = [(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]
+                else:
+                    continue
+                if len(pts) < 2:
+                    continue
+                try:
+                    if e.dxf.hasattr('true_color'):
+                        rgb = ezdxf_colors.int2rgb(e.dxf.true_color)
+                    else:
+                        aci = e.dxf.color if e.dxf.hasattr('color') else 256
+                        if aci in (0, 256):
+                            capa = e.dxf.layer
+                            if capa not in color_capa:
+                                color_capa[capa] = abs(doc.layers.get(capa).color) if capa in doc.layers else 7
+                            aci = color_capa[capa]
+                        rgb = ezdxf_colors.aci2rgb(aci)
+                except Exception:
+                    rgb = (190, 190, 190)
+                gris = max(rgb) - min(rgb) < 30
+                lineas.append((np.array(pts, dtype=float), '#BEBEBE' if gris else '#%02X%02X%02X' % tuple(rgb),
+                               0.3 if gris else 0.8))
+        self._cache_topo_planos = (firma, lineas)
+        return lineas
+
+    def _puntos_planos(self, plan, compromisos):
+        """Puntos que se dibujan en los planos de programa: el plan (mes operativo de inicio) más lo que cada
+        máquina tiene en curso (Perforando / Preinicio), que se muestra en el mes en que termina."""
+        columnas = ['Plataforma', 'ESTE', 'NORTE', 'Maquina', 'Mes', 'Periodo']
+        filas = [{'Plataforma': r.Plataforma, 'ESTE': r.ESTE, 'NORTE': r.NORTE, 'Maquina': r.Maquina, 'Mes': r.Mes,
+                  'Periodo': self._mes_personalizado(r.Fecha_Inicio)} for r in plan.itertuples()]
+        if compromisos is not None and not compromisos.empty:
+            for r in compromisos.dropna(subset=['ESTE', 'NORTE']).itertuples():
+                periodo = self._mes_personalizado(pd.Timestamp(r.Fecha_Liberacion))
+                filas.append({'Plataforma': r.Plataforma, 'ESTE': r.ESTE, 'NORTE': r.NORTE, 'Maquina': r.Maquina,
+                              'Mes': f"{MESES_ES[periodo.month - 1]} {periodo.year}", 'Periodo': periodo})
+        return pd.DataFrame(filas, columns=columnas).sort_values('Periodo', kind='stable').reset_index(drop=True)
+
+    def _dibujar_plano_programa(self, puntos, ejecutados, maquinas, mes=None):
+        """Plano de programa sobre la topografía: ejecutados en negro (círculo), puntos planificados con el
+        color del mes y la forma de su máquina. `mes` = None: plano general (todos los meses, sin etiquetas
+        de plataforma); con un mes: solo ese mes y con el nombre de cada plataforma. Devuelve la figura."""
+        from matplotlib.collections import LineCollection
+        from matplotlib.patches import Patch
+        from matplotlib.ticker import MultipleLocator, FuncFormatter
+        marcador = {m: PLAN_MARCADORES_MAQUINA[i % len(PLAN_MARCADORES_MAQUINA)] for i, m in enumerate(maquinas)}
+        usados = puntos if mes is None else puntos[puntos['Mes'] == mes]
+
+        todos_x = list(puntos['ESTE']) + list(ejecutados['ESTE'])
+        todos_y = list(puntos['NORTE']) + list(ejecutados['NORTE'])
+        margen = 350
+        x0, x1, y0, y1 = min(todos_x) - margen, max(todos_x) + margen, min(todos_y) - margen, max(todos_y) + margen
+        ancho = 13.0
+        alto = float(np.clip(ancho * (y1 - y0) / (x1 - x0), 7, 17))
+        fig, ax = plt.subplots(figsize=(ancho, alto))
+
+        grises = [(l, c, w) for l, c, w in self._leer_topografia_planos()]
+        for color_ancho in {(c, w) for _, c, w in grises}:
+            segmentos = [l for l, c, w in grises if (c, w) == color_ancho]
+            ax.add_collection(LineCollection(segmentos, colors=color_ancho[0], linewidths=color_ancho[1], zorder=1))
+        ax.scatter(ejecutados['ESTE'], ejecutados['NORTE'], s=26, c='black', marker='o', zorder=3)
+
+        etiquetados = []  # (x, y) de los puntos ya etiquetados, para apilar las etiquetas de plataformas muy juntas
+        for _, r in usados.sort_values(['ESTE', 'NORTE']).iterrows():
+            color = PLAN_COLORES_MES[r['Periodo'].month]
+            ax.scatter(r['ESTE'], r['NORTE'], s=85, c=color, marker=marcador[r['Maquina']], edgecolors='black',
+                       linewidths=0.7, zorder=5)
+            if mes is not None:
+                vecinos = sum(1 for ex, ey in etiquetados if np.hypot(ex - r['ESTE'], ey - r['NORTE']) < 110)
+                etiquetados.append((r['ESTE'], r['NORTE']))
+                ax.annotate(r['Plataforma'], (r['ESTE'], r['NORTE']), xytext=(8, 6 + 11 * vecinos), textcoords='offset points',
+                            fontsize=7.5, fontweight='bold', zorder=6,
+                            bbox=dict(boxstyle='round,pad=0.12', fc='white', ec='none', alpha=0.75),
+                            arrowprops=dict(arrowstyle='-', lw=0.5, color='#555555', shrinkA=0, shrinkB=4) if vecinos else None)
+
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_aspect('equal', adjustable='box')
+        ax.xaxis.set_major_locator(MultipleLocator(500))
+        ax.yaxis.set_major_locator(MultipleLocator(500))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f} E"))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f} N"))
+        ax.tick_params(labelsize=8)
+        plt.setp(ax.get_yticklabels(), rotation=90, va='center')
+        ax.grid(True, color='black', lw=0.5)
+
+        meses_presentes = list(dict.fromkeys(zip(usados['Periodo'], usados['Mes'])))
+        manejadores = [Line2D([], [], marker='o', ls='', color='black', ms=6, label='Ejecutado')]
+        manejadores += [Patch(facecolor=PLAN_COLORES_MES[per.month], edgecolor='black', label=f"Programa {nombre}")
+                        for per, nombre in meses_presentes]
+        manejadores += [Line2D([], [], marker=marcador[m], ls='', color='lightgray', mec='black', ms=7, label=m)
+                        for m in maquinas if (usados['Maquina'] == m).any()]
+        ax.legend(handles=manejadores, loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9, frameon=True,
+                  title="Leyenda\n(color = mes, forma = máquina)")
+        ax.set_title("Plano general de programa — ejecutados y planificados" if mes is None
+                     else f"Programa {mes} — {len(usados)} puntos", fontweight='bold')
+        return fig
+
+    def _generar_planos_mensuales(self, plan, compromisos, carpeta_png):
+        """Genera el plano general y un plano por mes (PNG en `carpeta_png`). Devuelve (lista de
+        (nombre de hoja, ruta del PNG), avisos)."""
+        avisos = []
+        if not hasattr(self, 'BD_Union_total'):
+            return [], avisos
+        ejecutados = self.BD_Union_total[self.BD_Union_total['Estado'] == 'Ejecutado'].dropna(subset=['ESTE', 'NORTE'])
+        puntos = self._puntos_planos(plan, compromisos)
+        if puntos.empty:
+            return [], avisos
+        if not self._leer_topografia_planos():
+            avisos.append("Los planos mensuales se dibujaron sin curvas de nivel: cargue la 'Carpeta Topografía' "
+                          "antes de generar el plan para incluirlas.")
+        maquinas = sorted(puntos['Maquina'].unique())
+        os.makedirs(carpeta_png, exist_ok=True)
+        planos = []
+        for mes in [None] + list(dict.fromkeys(puntos['Mes'])):
+            fig = self._dibujar_plano_programa(puntos, ejecutados, maquinas, mes)
+            nombre = "Plano General" if mes is None else f"Plano {mes}"
+            archivo = os.path.join(carpeta_png, re.sub(r'[^\w\-]+', '_', _strip_accents(nombre)) + ".png")
+            fig.savefig(archivo, dpi=130, bbox_inches='tight')
+            plt.close(fig)
+            planos.append((nombre[:31], archivo))
+        return planos, avisos
+
+    def _exportar_plan_excel(self, ruta, plan, compromisos, rendimiento, sin_coordenadas, zonas, avisos, ruta_png=None, extras=None,
+                             planos=None):
         """Excel del plan: Gantt, ploteo, Plan_Completo, una hoja por mes, resúmenes por mes y por
         máquina, compromisos actuales, rendimiento de 15 días, zonas cargadas, observaciones y,
         si se pasan, hojas extra (ej. conflictos del plan manual)."""
         from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.worksheet.properties import PageSetupProperties
         columnas = ['N', 'Mes', 'Horizonte', 'Maquina', 'Origen', 'Secuencia_Maquina', 'Orden_Manual', 'Plataforma', 'Identificador',
                     'Status_DDH', 'ESTE', 'NORTE', 'ELEV', 'LENGTH_m', 'Rendimiento_m_dia', 'Desde_Plataforma', 'Distancia_m',
                     'Dias_Instalacion', 'Dias_Perforacion', 'Dias_Desmovilizacion', 'Dias_Totales',
@@ -5889,6 +6046,20 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     hoja_img.add_image(imagen, 'A1')
                 except Exception as e:
                     print(f"No se pudo insertar el ploteo en el Excel: {e}")
+            for k, (nombre_hoja, archivo) in enumerate(planos or []):
+                try:
+                    from openpyxl.drawing.image import Image as XLImage
+                    hoja_plano = writer.book.create_sheet(nombre_hoja, min(1 + k, len(writer.book.worksheets)))
+                    imagen = XLImage(archivo)
+                    escala = 1300 / imagen.width
+                    imagen.width, imagen.height = imagen.width * escala, imagen.height * escala
+                    hoja_plano.add_image(imagen, 'A1')
+                    hoja_plano.page_setup.orientation = 'landscape'
+                    hoja_plano.page_setup.fitToWidth = 1
+                    hoja_plano.page_setup.fitToHeight = 1
+                    hoja_plano.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+                except Exception as e:
+                    print(f"No se pudo insertar {nombre_hoja} en el Excel: {e}")
             self._escribir_gantt(writer.book, plan, compromisos, zonas, posicion=0)
             writer.book.active = 0
 
@@ -5950,8 +6121,14 @@ class MyApp(QMainWindow, Ui_MainWindow):
         if ruta:
             ruta_png = os.path.splitext(ruta)[0] + ".png"
             self._render_plan_png(plan, estado_compromisos, datos['zonas'], ruta_png, titulo)
+            try:
+                planos, avisos_planos = self._generar_planos_mensuales(plan, estado_compromisos, os.path.splitext(ruta)[0] + "_planos")
+            except Exception as e:
+                traceback.print_exc()
+                planos, avisos_planos = [], [f"No se pudieron generar los planos mensuales: {type(e).__name__}: {e}"]
+            avisos = avisos + avisos_planos
             self._exportar_plan_excel(ruta, plan, estado_compromisos, datos['rendimiento'], datos['sin_coordenadas'],
-                                      datos['zonas'], avisos, ruta_png, extras)
+                                      datos['zonas'], avisos, ruta_png, extras, planos)
         resumen = plan.groupby('Mes', sort=False)['N'].count()
         texto = (f"{titulo}: {len(plan)} puntos, {plan['Maquina'].nunique()} máquinas, "
                  f"{plan['Fecha_Inicio'].min():%d/%m/%Y} a {plan['Fecha_Fin'].max():%d/%m/%Y}\n"
