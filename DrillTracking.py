@@ -903,6 +903,13 @@ class MyApp(QMainWindow, Ui_MainWindow):
     
                     self.BD_Union["INICIO.1"] = self._parse_fechas_control(self.BD_Union["INICIO.1"])
                     self.BD_Union["FIN.1"] = self._parse_fechas_control(self.BD_Union["FIN.1"])
+                    # FIN anterior a INICIO (error de digitación en Control de Proceso): se invierten para que el
+                    # "Metraje Descontado" no se pierda en silencio (date_range vacío / días negativos).
+                    invertido = self.BD_Union["FIN.1"] < self.BD_Union["INICIO.1"]
+                    if invertido.any():
+                        self.BD_Union.loc[invertido, ["INICIO.1", "FIN.1"]] = self.BD_Union.loc[invertido, ["FIN.1", "INICIO.1"]].values
+                        print("Fechas INICIO/FIN invertidas en Control de Proceso (se corrigieron): "
+                              + ", ".join(self.BD_Union.loc[invertido, "Sondaje"].astype(str)))
                     
                     # Calculamos la cantidad de días del rango (incluyente)
                     self.BD_Union["Dias_Rango"] = (self.BD_Union["FIN.1"] - self.BD_Union["INICIO.1"]).dt.days + 1
