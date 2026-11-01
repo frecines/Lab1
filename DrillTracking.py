@@ -5805,10 +5805,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
     # ---------------------------------------------------------------- planos mensuales (topografía + puntos)
     def _leer_topografia_planos(self):
-        """Líneas de la topografía importada (Carpeta Topografía) como lista de (puntos XY, color, ancho),
-        con el color de cada línea en el DXF (propio o de su capa): las curvas intermedias (blanco / negro /
-        gris) salen en gris fino y las de otro color (ej. las maestras en verde) conservan su color. Se
-        guarda en caché porque se dibuja en cada plano. Devuelve [] si no hay topografía."""
+        """Líneas de la topografía importada (Carpeta Topografía) como lista de arrays XY. En los planos de
+        programa TODA la topografía (curvas intermedias y maestras) se dibuja en gris. Se guarda en caché
+        porque se dibuja en cada plano. Devuelve [] si no hay topografía."""
         ruta = getattr(self, 'ruta_topo', None)
         if not ruta or not os.path.isdir(ruta):
             return []
@@ -5816,7 +5815,6 @@ class MyApp(QMainWindow, Ui_MainWindow):
         firma = (ruta, tuple((f, os.path.getmtime(os.path.join(ruta, f))) for f in archivos))
         if getattr(self, '_cache_topo_planos', (None, None))[0] == firma:
             return self._cache_topo_planos[1]
-        from ezdxf import colors as ezdxf_colors
         lineas = []
         for archivo in archivos:
             try:
@@ -5824,7 +5822,6 @@ class MyApp(QMainWindow, Ui_MainWindow):
             except Exception as e:
                 print(f"Error leyendo topografía {archivo}: {e}")
                 continue
-            color_capa = {}
             for e in doc.modelspace():
                 tipo = e.dxftype()
                 if tipo == "LWPOLYLINE":
@@ -5835,33 +5832,19 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     pts = [(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]
                 else:
                     continue
-                if len(pts) < 2:
-                    continue
-                try:
-                    if e.dxf.hasattr('true_color'):
-                        rgb = ezdxf_colors.int2rgb(e.dxf.true_color)
-                    else:
-                        aci = e.dxf.color if e.dxf.hasattr('color') else 256
-                        if aci in (0, 256):
-                            capa = e.dxf.layer
-                            if capa not in color_capa:
-                                color_capa[capa] = abs(doc.layers.get(capa).color) if capa in doc.layers else 7
-                            aci = color_capa[capa]
-                        rgb = ezdxf_colors.aci2rgb(aci)
-                except Exception:
-                    rgb = (190, 190, 190)
-                gris = max(rgb) - min(rgb) < 30
-                lineas.append((np.array(pts, dtype=float), '#BEBEBE' if gris else '#%02X%02X%02X' % tuple(rgb),
-                               0.3 if gris else 0.8))
+                if len(pts) >= 2:
+                    lineas.append(np.array(pts, dtype=float))
         self._cache_topo_planos = (firma, lineas)
         return lineas
 
     def _puntos_planos(self, plan, compromisos):
         """Puntos que se dibujan en los planos de programa: el plan (mes operativo de inicio) más lo que cada
         máquina tiene en curso (Perforando / Preinicio), que se muestra en el mes en que termina."""
-        columnas = ['Plataforma', 'ESTE', 'NORTE', 'Maquina', 'Mes', 'Periodo']
+        columnas = ['Plataforma', 'ESTE', 'NORTE', 'Maquina', 'Mes', 'Periodo', 'Desde_ESTE', 'Desde_NORTE', 'Desde_Plataforma']
         filas = [{'Plataforma': r.Plataforma, 'ESTE': r.ESTE, 'NORTE': r.NORTE, 'Maquina': r.Maquina, 'Mes': r.Mes,
-                  'Periodo': self._mes_personalizado(r.Fecha_Inicio)} for r in plan.itertuples()]
+                  'Periodo': self._mes_personalizado(r.Fecha_Inicio), 'Desde_ESTE': r.Desde_ESTE, 'Desde_NORTE': r.Desde_NORTE,
+                  'Desde_Plataforma': r.Desde_Plataforma}
+                 for r in plan.itertuples()]
         if compromisos is not None and not compromisos.empty:
             for r in compromisos.dropna(subset=['ESTE', 'NORTE']).itertuples():
                 periodo = self._mes_personalizado(pd.Timestamp(r.Fecha_Liberacion))
@@ -5887,12 +5870,28 @@ class MyApp(QMainWindow, Ui_MainWindow):
         alto = float(np.clip(ancho * (y1 - y0) / (x1 - x0), 7, 17))
         fig, ax = plt.subplots(figsize=(ancho, alto))
 
-        grises = [(l, c, w) for l, c, w in self._leer_topografia_planos()]
-        for color_ancho in {(c, w) for _, c, w in grises}:
-            segmentos = [l for l, c, w in grises if (c, w) == color_ancho]
-            ax.add_collection(LineCollection(segmentos, colors=color_ancho[0], linewidths=color_ancho[1], zorder=1))
+        topografia = self._leer_topografia_planos()
+        if topografia:
+            ax.add_collection(LineCollection(topografia, colors='#BDBDBD', linewidths=0.35, zorder=1))
         ax.scatter(ejecutados['ESTE'], ejecutados['NORTE'], s=26, c='black', marker='o', zorder=3)
 
+        # Movimientos: flecha fina desde donde estaba la máquina hasta el punto (el origen puede ser del mes anterior)
+        for _, r in usados.dropna(subset=['Desde_ESTE', 'Desde_NORTE']).iterrows():
+            if np.hypot(r['ESTE'] - r['Desde_ESTE'], r['NORTE'] - r['Desde_NORTE']) < 1:
+                continue
+            ax.annotate("", xy=(r['ESTE'], r['NORTE']), xytext=(r['Desde_ESTE'], r['Desde_NORTE']), zorder=4,
+                        arrowprops=dict(arrowstyle='-|>', color=PLAN_COLORES_MES[r['Periodo'].month], lw=0.7,
+                                        shrinkA=5, shrinkB=7, mutation_scale=8, alpha=0.95))
+        # Origen de una flecha que no es un punto dibujado en este plano (viene de otro mes): círculo hueco con su nombre
+        hay_origen_externo = False
+        for _, r in usados.dropna(subset=['Desde_ESTE', 'Desde_NORTE']).drop_duplicates(['Desde_ESTE', 'Desde_NORTE']).iterrows():
+            if np.hypot(usados['ESTE'] - r['Desde_ESTE'], usados['NORTE'] - r['Desde_NORTE']).min() < 5:
+                continue
+            hay_origen_externo = True
+            ax.scatter(r['Desde_ESTE'], r['Desde_NORTE'], s=45, facecolors='white', edgecolors='#666666', linewidths=0.9, zorder=4)
+            if isinstance(r['Desde_Plataforma'], str) and not r['Desde_Plataforma'].startswith('('):
+                ax.annotate(r['Desde_Plataforma'], (r['Desde_ESTE'], r['Desde_NORTE']), xytext=(7, -10), textcoords='offset points',
+                            fontsize=7, style='italic', color='#555555', zorder=4)
         etiquetados = []  # (x, y) de los puntos ya etiquetados, para apilar las etiquetas de plataformas muy juntas
         for _, r in usados.sort_values(['ESTE', 'NORTE']).iterrows():
             color = PLAN_COLORES_MES[r['Periodo'].month]
@@ -5923,9 +5922,12 @@ class MyApp(QMainWindow, Ui_MainWindow):
                         for per, nombre in meses_presentes]
         manejadores += [Line2D([], [], marker=marcador[m], ls='', color='lightgray', mec='black', ms=7, label=m)
                         for m in maquinas if (usados['Maquina'] == m).any()]
+        manejadores.append(Line2D([], [], color='#444444', lw=0.8, marker='>', ms=4, label='Movimiento de máquina'))
+        if hay_origen_externo:
+            manejadores.append(Line2D([], [], marker='o', ls='', mfc='white', mec='#666666', ms=6, label='Origen (punto de otro mes)'))
         ax.legend(handles=manejadores, loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9, frameon=True,
                   title="Leyenda\n(color = mes, forma = máquina)")
-        ax.set_title("Plano general de programa — ejecutados y planificados" if mes is None
+        ax.set_title("Plano general de programa — ejecutados, planificados y movimientos" if mes is None
                      else f"Programa {mes} — {len(usados)} puntos", fontweight='bold')
         return fig
 
