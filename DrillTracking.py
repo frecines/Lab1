@@ -104,6 +104,14 @@ PLAN_MIN_DIAS_CON_AVANCE = 5   # días con metros > 0 dentro de la ventana (y, e
 # Progress (material volado) que NO se mina en el mes es una ventana de oportunidad: para elegir
 # el punto "más cercano" su distancia se multiplica por este factor (0.8 = se ve un 20% más cerca).
 PLAN_FACTOR_PROGRESS = 0.8
+# Operativamente es difícil atender muchas máquinas juntas: dentro de PLAN_RADIO_MAQUINAS_M de cualquier
+# máquina no puede haber más de PLAN_MAX_MAQUINAS_RADIO máquinas trabajando a la vez (esa máquina incluida)
+# y, mientras haya otra opción, se prefiere que cada zona tenga una sola (se acepta una segunda solo si no
+# hay un punto libre fuera del radio al que la máquina pueda entrar sin esperar).
+PLAN_RADIO_MAQUINAS_M = 400
+PLAN_MAX_MAQUINAS_RADIO = 2
+PLAN_PREFERIR_UNA_MAQUINA = True
+_CLAVE_ZONA = "__zona__"  # en ocupacion_vias: ocupación de TODAS las máquinas (sin importar la vía)
 # Status de la hoja DDH (sin tildes, minúsculas) que indican que la plataforma ya tiene máquina
 # o ya se perforó; si CUALQUIER fila de una plataforma (gemelos incluidos) tiene uno de estos,
 # esa plataforma no es un punto pendiente.
@@ -5037,10 +5045,45 @@ class MyApp(QMainWindow, Ui_MainWindow):
         return rend, corte
 
     @staticmethod
-    def _primer_inicio_factible(t, duracion, bloqueos, vias, ocupacion_vias, x, y):
+    def _registrar_ocupacion(ocupacion, vias, ini, fin, maquina, x, y):
+        """Anota que `maquina` ocupa (x, y) entre ini y fin: en cada una de las vías que cierra y en la
+        lista general (_CLAVE_ZONA) con que se controla la cantidad de máquinas por radio."""
+        registro = (ini, fin, maquina, float(x), float(y))
+        for via in vias:
+            ocupacion.setdefault(via, []).append(registro)
+        ocupacion.setdefault(_CLAVE_ZONA, []).append(registro)
+
+    @staticmethod
+    def _conflicto_densidad(ini, fin, x, y, maquina, ocupacion):
+        """Revisa, durante [ini, fin), cuántas máquinas quedarían juntas si `maquina` trabajara en (x, y).
+        Hay conflicto si en algún momento más de PLAN_MAX_MAQUINAS_RADIO máquinas (la nueva incluida)
+        quedan dentro de PLAN_RADIO_MAQUINAS_M de la nueva o de alguna otra máquina que a su vez esté
+        cerca de la nueva. Devuelve (fecha en que termina la primera máquina que obliga a esperar o None,
+        nombres de las otras máquinas que comparten el radio con el punto durante el intervalo)."""
+        activas = [o for o in ocupacion.get(_CLAVE_ZONA, []) if o[2] != maquina and o[0] < fin and o[1] > ini]
+        if not activas:
+            return None, []
+        radio = PLAN_RADIO_MAQUINAS_M
+        cortes = sorted({ini, fin} | {t for o in activas for t in (o[0], o[1]) if ini < t < fin})
+        cercanas, espera = set(), None
+        for a, b in zip(cortes[:-1], cortes[1:]):
+            en = [o for o in activas if o[0] <= a and o[1] >= b]
+            pos = [(x, y)] + [(o[3], o[4]) for o in en]
+            cercanas.update(o[2] for o in en if np.hypot(o[3] - x, o[4] - y) <= radio)
+            for cx, cy in pos:
+                dentro = [k for k, (px, py) in enumerate(pos) if np.hypot(px - cx, py - cy) <= radio]
+                if 0 in dentro and len(dentro) > PLAN_MAX_MAQUINAS_RADIO:
+                    fin_espera = min(en[k - 1][1] for k in dentro if k > 0)
+                    espera = fin_espera if espera is None else min(espera, fin_espera)
+        return espera, sorted(cercanas)
+
+    @staticmethod
+    def _primer_inicio_factible(t, duracion, bloqueos, vias, ocupacion_vias, x, y, maquina=None):
         """Primera fecha >= t en que el punto (x, y) puede ocuparse `duracion` sin cruzarse con
-        una ventana SEM/PERFO que lo contiene ni con otra máquina sobre la misma vía a
-        <= PLAN_TRAMO_VIA_M (mismo tramo cerrado). Devuelve (fecha, motivo de la última espera o "")."""
+        una ventana SEM/PERFO que lo contiene, con otra máquina sobre la misma vía a
+        <= PLAN_TRAMO_VIA_M (mismo tramo cerrado) ni —si se indica `maquina`— con una concentración de
+        más de PLAN_MAX_MAQUINAS_RADIO máquinas en PLAN_RADIO_MAQUINAS_M. Devuelve (fecha, motivo de la
+        última espera o "")."""
         s, motivo = t, ""
         for _ in range(10000):
             conflicto = None
@@ -5056,6 +5099,11 @@ class MyApp(QMainWindow, Ui_MainWindow):
                             break
                     if conflicto:
                         break
+            if conflicto is None and maquina is not None:
+                fin_espera, cercanas = MyApp._conflicto_densidad(s, s + duracion, x, y, maquina, ocupacion_vias)
+                if fin_espera is not None:
+                    conflicto = (fin_espera, f"Ya hay {PLAN_MAX_MAQUINAS_RADIO} máquinas a <= {PLAN_RADIO_MAQUINAS_M} m "
+                                             f"({', '.join(cercanas)})")
             if conflicto is None:
                 return s, motivo
             s, motivo = conflicto
@@ -5097,8 +5145,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 fin = t + pd.Timedelta(days=dias)
                 if pd.notna(r['ESTE']) and pd.notna(r['NORTE']):
                     pos, plataforma = (float(r['ESTE']), float(r['NORTE'])), r['Plataforma']
-                    for via in self._restricciones_punto(pos[0], pos[1], zonas)['vias']:
-                        ocupacion_vias.setdefault(via, []).append((t, fin, maquina, pos[0], pos[1]))
+                    self._registrar_ocupacion(ocupacion_vias, self._restricciones_punto(pos[0], pos[1], zonas)['vias'],
+                                              t, fin, maquina, pos[0], pos[1])
                 filas_comp.append({'Maquina': maquina, 'Plataforma': r['Plataforma'], 'Identificador': r['Identificador'],
                                    'Estado': r['Status'], 'ESTE': r['ESTE'], 'NORTE': r['NORTE'],
                                    'Metros_Faltantes': round(float(metros), 1), 'Rendimiento_m_dia': rate,
@@ -5108,7 +5156,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         return maquinas, pd.DataFrame(filas_comp), ocupacion_vias
 
     @staticmethod
-    def _fila_plan(maquina, datos, p, rest, inicio, duracion, dias_perf, distancia, espera=0, motivo=""):
+    def _fila_plan(maquina, datos, p, rest, inicio, duracion, dias_perf, distancia, espera=0, motivo="", cercanas=()):
         """Una fila del plan (mismo formato para el plan automático y el manual)."""
         return {
             'Maquina': maquina, 'Plataforma': p['Plataforma'], 'Identificador': p['Identificador'],
@@ -5120,7 +5168,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
             'Dias_Desmovilizacion': PLAN_DIAS_DESMOVILIZACION, 'Dias_Totales': duracion.days,
             'Fecha_Inicio': inicio, 'Fecha_Fin': inicio + duracion - pd.Timedelta(days=1),
             'Espera_dias': espera, 'Motivo_Espera': motivo if espera > 0 else "",
-            'Zona': rest['zona'], 'Conflicto': False, 'Motivo_Conflicto': "", 'Fecha_Sugerida': pd.NaT, 'Ajuste': "",
+            'Zona': rest['zona'], 'Maquinas_Cercanas': ", ".join(cercanas), 'Conflicto': False, 'Motivo_Conflicto': "", 'Fecha_Sugerida': pd.NaT, 'Ajuste': "",
             'Origen': "Automático", 'Observacion': "",
         }
 
@@ -5162,19 +5210,21 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 duracion = pd.Timedelta(days=PLAN_DIAS_INSTALACION + int(np.ceil(dias_perf)) + PLAN_DIAS_DESMOVILIZACION)
                 rest = restricciones[i]
                 inicio, motivo = self._primer_inicio_factible(datos['t_libre'], duracion, rest['bloqueos'],
-                                                              rest['vias'], ocupacion_vias, p['ESTE'], p['NORTE'])
+                                                              rest['vias'], ocupacion_vias, p['ESTE'], p['NORTE'], maquina)
                 distancia = float(np.hypot(p['ESTE'] - datos['pos'][0], p['NORTE'] - datos['pos'][1]))
                 costo = distancia * (PLAN_FACTOR_PROGRESS if rest['en_progress'] and not rest['en_sem'] else 1.0)
-                clave = (inicio > datos['t_libre'], inicio if inicio > datos['t_libre'] else pd.Timestamp.min, costo)
+                cercanas = self._conflicto_densidad(inicio, inicio + duracion, p['ESTE'], p['NORTE'], maquina, ocupacion_vias)[1]
+                comparte = bool(cercanas) and PLAN_PREFERIR_UNA_MAQUINA
+                # 1) sin esperar, 2) el que antes pueda entrar, 3) sin otra máquina cerca, 4) el más cercano
+                clave = (inicio > datos['t_libre'], inicio if inicio > datos['t_libre'] else pd.Timestamp.min, comparte, costo)
                 if mejor is None or clave < mejor[0]:
-                    mejor = (clave, i, inicio, motivo, duracion, dias_perf, distancia)
-            _, i, inicio, motivo, duracion, dias_perf, distancia = mejor
+                    mejor = (clave, i, inicio, motivo, duracion, dias_perf, distancia, cercanas)
+            _, i, inicio, motivo, duracion, dias_perf, distancia, cercanas = mejor
             p, rest = pendientes.iloc[i], restricciones[i]
             fin = inicio + duracion
-            for via in rest['vias']:
-                ocupacion_vias.setdefault(via, []).append((inicio, fin, maquina, float(p['ESTE']), float(p['NORTE'])))
+            self._registrar_ocupacion(ocupacion_vias, rest['vias'], inicio, fin, maquina, p['ESTE'], p['NORTE'])
             filas.append(self._fila_plan(maquina, datos, p, rest, inicio, duracion, dias_perf, distancia,
-                                         espera=(inicio - datos['t_libre']).days, motivo=motivo))
+                                         espera=(inicio - datos['t_libre']).days, motivo=motivo, cercanas=cercanas))
             datos.update({'t_libre': fin, 'pos': (float(p['ESTE']), float(p['NORTE'])), 'plataforma': p['Plataforma']})
             libres.discard(i)
         return filas
@@ -5382,6 +5432,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     distancia_via = float(np.hypot(x - ox, y - oy))
                     if o_maq != maquina and inicio < o_fin and fin > o_ini and distancia_via <= PLAN_TRAMO_VIA_M:
                         motivos.append(f"vía {via} cerrada por {o_maq} ({o_ini:%d/%m}-{o_fin - un_dia:%d/%m}, a {distancia_via:.0f} m)")
+            fin_densidad, cercanas = self._conflicto_densidad(inicio, fin, x, y, maquina, ocupacion_vias)
+            if fin_densidad is not None:
+                motivos.append(f"ya habría más de {PLAN_MAX_MAQUINAS_RADIO} máquinas a <= {PLAN_RADIO_MAQUINAS_M} m "
+                               f"({', '.join(cercanas)}) entre el {inicio:%d/%m} y el {fin - un_dia:%d/%m}")
             if motivos:
                 descartar(fila, "No se puede ingresar: " + "; ".join(motivos), key)
                 continue
@@ -5390,11 +5444,11 @@ class MyApp(QMainWindow, Ui_MainWindow):
             fila_plan = self._fila_plan(maquina, dict(datos, rate=rate), p, rest, inicio, duracion, dias_perf,
                                         float(np.hypot(x - datos['pos'][0], y - datos['pos'][1])),
                                         espera=(inicio - datos['t_libre']).days,
-                                        motivo="Fecha indicada en el plan manual" if inicio > datos['t_libre'] else "")
+                                        motivo="Fecha indicada en el plan manual" if inicio > datos['t_libre'] else "",
+                                        cercanas=cercanas)
             fila_plan.update({'Origen': "Manual", 'Ajuste': ajuste, 'Observacion': fila['Observacion'], 'Orden_Manual': fila['Orden']})
             filas.append(fila_plan)
-            for via in rest['vias']:
-                ocupacion_vias.setdefault(via, []).append((inicio, fin, maquina, x, y))
+            self._registrar_ocupacion(ocupacion_vias, rest['vias'], inicio, fin, maquina, x, y)
             datos.update({'t_libre': fin, 'pos': (x, y), 'plataforma': cat['Plataforma']})
             aceptadas.add(key)
 
@@ -5587,6 +5641,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                          f"LENGTH: {r['LENGTH_m']:.0f} m | {r['Dias_Totales']} d (1+{r['Dias_Perforacion']}+1)\n"
                          f"{r['Fecha_Inicio']:%d/%m/%Y} → {r['Fecha_Fin']:%d/%m/%Y}\nDesde: {r['Desde_Plataforma']} ({r['Distancia_m']:.0f} m)\n"
                          f"Zona: {r['Zona']}")
+                if r.get('Maquinas_Cercanas'):
+                    texto += f"\nMáquinas a <= {PLAN_RADIO_MAQUINAS_M} m: {r['Maquinas_Cercanas']}"
                 if r['Espera_dias']:
                     texto += f"\nEspera {r['Espera_dias']} d: {r['Motivo_Espera']}"
                 if r.get('Ajuste'):
@@ -5751,7 +5807,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         columnas = ['N', 'Mes', 'Horizonte', 'Maquina', 'Origen', 'Secuencia_Maquina', 'Orden_Manual', 'Plataforma', 'Identificador',
                     'Status_DDH', 'ESTE', 'NORTE', 'ELEV', 'LENGTH_m', 'Rendimiento_m_dia', 'Desde_Plataforma', 'Distancia_m',
                     'Dias_Instalacion', 'Dias_Perforacion', 'Dias_Desmovilizacion', 'Dias_Totales',
-                    'Fecha_Inicio', 'Fecha_Fin', 'Espera_dias', 'Motivo_Espera', 'Conflicto', 'Motivo_Conflicto',
+                    'Fecha_Inicio', 'Fecha_Fin', 'Espera_dias', 'Motivo_Espera', 'Maquinas_Cercanas', 'Conflicto', 'Motivo_Conflicto',
                     'Fecha_Sugerida', 'Ajuste', 'Zona', 'Observacion', 'LENGTH_estimado']
         tabla = plan[[c for c in columnas if c in plan.columns]].copy()
         for col in ('Fecha_Inicio', 'Fecha_Fin', 'Fecha_Sugerida'):
@@ -5782,6 +5838,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
             f"Puntos a <= {PLAN_BUFFER_VIAS_M} m de una vía la cierran: no puede haber otra máquina en la misma vía "
             f"a <= {PLAN_TRAMO_VIA_M} m al mismo tiempo.",
             f"Progress no minado en el mes se prioriza en el plan automático (distancia x {PLAN_FACTOR_PROGRESS}).",
+            f"Nunca más de {PLAN_MAX_MAQUINAS_RADIO} máquinas a la vez dentro de {PLAN_RADIO_MAQUINAS_M} m; mientras haya "
+            f"otra opción, el plan evita poner una segunda máquina en la misma zona (columna Maquinas_Cercanas).",
         ]})
 
         with pd.ExcelWriter(ruta, engine='openpyxl') as writer:
