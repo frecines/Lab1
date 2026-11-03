@@ -1084,7 +1084,23 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     real_diario = real_diario.sort_values("Fecha")
                     real_diario["Real_Acumulado"] = real_diario["Avance_Real_Diario"].cumsum()
                     
-                    curva_s = self.plan.merge(
+                    # Si el plan termina ANTES que los reportes (ej. el plan llega a 28,000 m el 22/10 y hay reportes
+                    # hasta el 01/11), el merge por fecha cortaba la Curva S real —y la "Fecha de corte" del Word—
+                    # en la última fecha del plan. Se extiende el plan con su último acumulado (queda plano) hasta
+                    # la última fecha con avance real, para que el corte sea el del último reporte cargado.
+                    plan_curva = self.plan.copy()
+                    plan_curva["Fecha"] = pd.to_datetime(plan_curva["Fecha"])
+                    ultima_plan, ultima_real = plan_curva["Fecha"].max(), real_diario["Fecha"].max()
+                    aviso_plan = ""
+                    if ultima_real > ultima_plan:
+                        ultimo_acumulado = plan_curva.sort_values("Fecha")["Plan_Acumulado"].dropna().iloc[-1]
+                        extension = pd.DataFrame({"Fecha": pd.date_range(ultima_plan + pd.Timedelta(days=1), ultima_real),
+                                                  "Plan_Acumulado": ultimo_acumulado})
+                        plan_curva = pd.concat([plan_curva, extension], ignore_index=True)
+                        aviso_plan = (f"\n\nEl plan termina el {ultima_plan:%d/%m/%Y} pero hay avance real hasta el "
+                                      f"{ultima_real:%d/%m/%Y}: se mantuvo el plan en {ultimo_acumulado:,.0f} m desde esa "
+                                      f"fecha para que la Curva S y la fecha de corte lleguen al último reporte.")
+                    curva_s = plan_curva.merge(
                         real_diario,
                         on="Fecha",
                         how="left"
@@ -1107,7 +1123,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     # Guardamos el resultado en el objeto de la clase
                     self.curva_s = curva_s
                     
-                    QMessageBox.information(self, "Éxito", "Se importó y procesó correctamente el archivo.")
+                    QMessageBox.information(self, "Éxito", "Se importó y procesó correctamente el archivo." + aviso_plan)
                     print(self.curva_s)
                     self.Mensajes.setText("Se cargo el Plan para Curva S")
                     self.CurvaS.setEnabled(True)
