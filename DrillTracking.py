@@ -52,6 +52,10 @@ FECHA_LICENCIA = datetime(2027, 12, 31).date()
 # reportes digitales: sus metros se toman de Control de Proceso (ver _detectar_sondajes_externos).
 PREFIJOS_SONDAJE_PROYECTO = ("MR",)
 
+# Tolerancia (m) para marcar un turno cuyo Avance (Prof. Final - Prof. Inicial, celda G9) no coincide con el
+# total de metros de su tabla BROCAS/TRICONO (ver _diferencias_avance_brocas).
+TOLERANCIA_AVANCE_BROCAS_M = 0.1
+
 OBJETIVO_DIARIO_M = 35  # Metros objetivo por máquina por día
 META_TOTAL_PROYECTO = 28000  # Meta contractual total del proyecto, en metros
 STALE_DAYS = 10  # Días sin reportar avance, sin señales en comentarios, para considerar retirada
@@ -370,6 +374,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         self.CargarPlanManual.clicked.connect(self.CargarPlanManualExcel)
         self.Mensajes.setStyleSheet("color: blue; font-weight: bold;")
         self.errores_carga = []  # Errores detectados al leer los Excel de reportes (LoadReport)
+        self.diferencias_brocas = pd.DataFrame()  # Turnos con avance distinto del total de su tabla de brocas
         self.categorias_paradas_no_reconocidas = []  # Etiquetas de paradas sin categoría conocida
 
         if datetime.now().date() > FECHA_LICENCIA:
@@ -574,12 +579,64 @@ class MyApp(QMainWindow, Ui_MainWindow):
         valores = valores[valores != ""]
         return sorted(valores.unique())
 
+    def _diferencias_avance_brocas(self, tolerancia=TOLERANCIA_AVANCE_BROCAS_M):
+        """Turnos cuyo AVANCE (celda G9: Prof. Final - Prof. Inicial, lo que suma el Excel de revisión) no
+        coincide con los metros de su tabla BROCAS/TRICONO (lo que suma la tabla de brocas del Word). Las
+        diferencias suelen venir de la hoja de origen: celdas Desde/Hasta de la broca escritas a mano
+        (se pisó la fórmula =MIN/=MAX), una Prof. Final que no coincide con el último tramo perforado, o un
+        turno sin tabla de brocas. Devuelve un DataFrame por turno con la diferencia (Avance - Brocas) y la
+        causa probable, ordenado por fecha. Los metros se calculan igual que en _build_resumen_brocas."""
+        columnas = ['Archivo', 'Hoja', 'Fecha', 'Turno', 'Maquina', 'Sondaje', 'Avance_Turno', 'Metros_Brocas',
+                    'Diferencia', 'Mes_Periodo', 'Causa']
+        filas = []
+        for _, fila in self.df.iterrows():
+            brocas = fila['Detalle_Brocas'] if isinstance(fila['Detalle_Brocas'], list) else []
+            triconos = fila['Detalle_Tricono'] if isinstance(fila['Detalle_Tricono'], list) else []
+            metros_brocas = 0.0
+            for broca in brocas:
+                metros_brocas += sum(self._distribuir_en_buckets(broca['desde'], broca['hasta']).values())
+            for tricono in triconos:
+                metros = tricono['total']
+                if pd.isna(metros) and pd.notna(tricono['desde']) and pd.notna(tricono['hasta']):
+                    metros = tricono['hasta'] - tricono['desde']
+                if pd.notna(metros) and metros > 0:
+                    metros_brocas += metros
+            avance = float(fila['Avance Turno']) if pd.notna(fila['Avance Turno']) else 0.0
+            diferencia = round(avance - metros_brocas, 3)
+            if abs(diferencia) <= tolerancia:
+                continue
+            if not brocas and not triconos:
+                causa = "El turno no tiene tabla BROCAS/TRICONO con datos: sus metros no entran a la tabla de brocas."
+            elif avance > 0 and metros_brocas == 0:
+                causa = ("La tabla BROCAS no registra metros (Desde = Hasta, total 0) pero el avance del turno es "
+                         f"{avance:,.2f} m: revisar si se pisaron las fórmulas Desde/Hasta de la broca.")
+            elif avance == 0:
+                causa = (f"La tabla de brocas registra {metros_brocas:,.2f} m pero el avance del turno "
+                         "(Prof. Final - Prof. Inicial) es 0.")
+            elif diferencia > 0:
+                causa = (f"El avance supera en {diferencia:,.2f} m al total de brocas: la Prof. Final es mayor que el "
+                         "último tramo perforado o falta un tramo en la tabla de perforación.")
+            else:
+                causa = (f"El total de brocas supera en {-diferencia:,.2f} m al avance: revisar Prof. Inicial/Final o "
+                         "tramos repetidos en la hoja.")
+            fecha = pd.Timestamp(fila['Fecha']).normalize()
+            filas.append({'Archivo': fila['Archivo'], 'Hoja': fila['Hoja'], 'Fecha': fecha, 'Turno': fila['Turno'],
+                          'Maquina': fila['Maquina'], 'Sondaje': fila['Sondaje'], 'Avance_Turno': round(avance, 3),
+                          'Metros_Brocas': round(metros_brocas, 3), 'Diferencia': diferencia,
+                          'Mes_Periodo': self._mes_personalizado(fecha), 'Causa': causa})
+        if not filas:
+            return pd.DataFrame(columns=columnas)
+        return pd.DataFrame(filas)[columnas].sort_values(['Fecha', 'Maquina', 'Hoja']).reset_index(drop=True)
+
     def _exportar_reporte_errores(self, carpeta):
         """Exporta a Word (o a texto plano si no hay python-docx instalado) el listado de
         errores detectados durante la carga de reportes: en qué archivo Excel, en qué
         hoja y por qué falló, para poder ubicarlos y corregirlos sin depender de tener
         abierta la consola de Spyder."""
-        if not self.errores_carga:
+        diferencias = getattr(self, 'diferencias_brocas', None)
+        if diferencias is None:
+            diferencias = pd.DataFrame()
+        if not self.errores_carga and diferencias.empty:
             return None
 
         fecha_hoy = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -590,25 +647,52 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 titulo = doc.add_heading('Errores Detectados al Cargar Reportes de Perforación', level=0)
                 titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 doc.add_paragraph(f"Generado el {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-                doc.add_paragraph(
-                    f"Se detectaron {len(self.errores_carga)} inconsistencia(s) durante la lectura de "
-                    f"los archivos Excel de la carpeta seleccionada. Las filas afectadas fueron "
-                    f"excluidas del análisis para que el resto de la información sí se pueda usar; "
-                    f"corrija el Excel indicado (archivo y hoja) y vuelva a cargar la carpeta."
-                )
+                if self.errores_carga:
+                    doc.add_paragraph(
+                        f"Se detectaron {len(self.errores_carga)} inconsistencia(s) durante la lectura de "
+                        f"los archivos Excel de la carpeta seleccionada. Las filas afectadas fueron "
+                        f"excluidas del análisis para que el resto de la información sí se pueda usar; "
+                        f"corrija el Excel indicado (archivo y hoja) y vuelva a cargar la carpeta."
+                    )
 
-                tabla = doc.add_table(rows=1, cols=4)
-                tabla.style = 'Light Grid Accent 1'
-                hdr = tabla.rows[0].cells
-                hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text = (
-                    'Archivo Excel', 'Hoja', 'Tipo de Error', 'Detalle'
-                )
-                for err in self.errores_carga:
-                    row = tabla.add_row().cells
-                    row[0].text = err["archivo"]
-                    row[1].text = err["hoja"]
-                    row[2].text = err["tipo"]
-                    row[3].text = err["detalle"]
+                    tabla = doc.add_table(rows=1, cols=4)
+                    tabla.style = 'Light Grid Accent 1'
+                    hdr = tabla.rows[0].cells
+                    hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text = (
+                        'Archivo Excel', 'Hoja', 'Tipo de Error', 'Detalle'
+                    )
+                    for err in self.errores_carga:
+                        row = tabla.add_row().cells
+                        row[0].text = err["archivo"]
+                        row[1].text = err["hoja"]
+                        row[2].text = err["tipo"]
+                        row[3].text = err["detalle"]
+
+                if not diferencias.empty:
+                    doc.add_heading('Diferencias entre el Avance del turno y la tabla de brocas', level=1)
+                    doc.add_paragraph(
+                        f"{len(diferencias)} turno(s) tienen un Avance (celda G9 = Prof. Final - Prof. Inicial, lo que "
+                        f"suma el Excel de revisión) distinto del total de su tabla BROCAS/TRICONO (lo que suma la "
+                        f"tabla de brocas del reporte semanal) en más de {TOLERANCIA_AVANCE_BROCAS_M} m. Estas filas NO "
+                        f"se excluyeron del análisis: los metros del reporte se mantienen; corrija la hoja indicada "
+                        f"para que ambas cifras coincidan. Diferencia = Avance - Brocas."
+                    )
+                    tabla_dif = doc.add_table(rows=1, cols=8)
+                    tabla_dif.style = 'Light Grid Accent 1'
+                    cab = tabla_dif.rows[0].cells
+                    for c, texto in zip(cab, ('Archivo Excel', 'Hoja', 'Fecha', 'Máquina', 'Avance (m)', 'Brocas (m)',
+                                              'Diferencia (m)', 'Causa probable')):
+                        c.text = texto
+                    for r in diferencias.itertuples():
+                        row = tabla_dif.add_row().cells
+                        row[0].text = str(r.Archivo)
+                        row[1].text = str(r.Hoja)
+                        row[2].text = r.Fecha.strftime('%d/%m/%Y')
+                        row[3].text = str(r.Maquina)
+                        row[4].text = f"{r.Avance_Turno:,.2f}"
+                        row[5].text = f"{r.Metros_Brocas:,.2f}"
+                        row[6].text = f"{r.Diferencia:+,.2f}"
+                        row[7].text = r.Causa
 
                 doc.save(nombre_archivo)
                 return nombre_archivo
@@ -623,6 +707,11 @@ class MyApp(QMainWindow, Ui_MainWindow):
                         f.write(f"Tipo: {err['tipo']}\n")
                         f.write(f"Detalle: {err['detalle']}\n")
                         f.write("-" * 60 + "\n")
+                    if not diferencias.empty:
+                        f.write("\nDIFERENCIAS ENTRE EL AVANCE DEL TURNO Y LA TABLA DE BROCAS (no se excluyen)\n")
+                        for r in diferencias.itertuples():
+                            f.write(f"{r.Archivo} | {r.Hoja} | {r.Maquina} | Avance {r.Avance_Turno:,.2f} | "
+                                    f"Brocas {r.Metros_Brocas:,.2f} | Dif {r.Diferencia:+,.2f} | {r.Causa}\n")
                 return nombre_archivo
         except Exception as e:
             print(f"No se pudo exportar el reporte de errores: {e}")
@@ -638,6 +727,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
             self.PlotLab.setEnabled(False) 
             self.Mensajes.clear()
             self.errores_carga = []
+            self.diferencias_brocas = pd.DataFrame()
             self.categorias_paradas_no_reconocidas = []
             # 1. Obtener ruta y validar
             dir_path = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta")
@@ -854,12 +944,25 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 print(self.df.head())
 
                 mensaje_exito = f"Se cargaron {len(self.df)} registros."
-                if self.errores_carga:
+                try:
+                    self.diferencias_brocas = self._diferencias_avance_brocas()
+                except Exception as e_dif:
+                    traceback.print_exc()
+                    self.diferencias_brocas = pd.DataFrame()
+                    print(f"No se pudo comparar el avance con la tabla de brocas: {e_dif}")
+                if self.errores_carga or not self.diferencias_brocas.empty:
                     archivo_errores = self._exportar_reporte_errores(str(ruta))
-                    mensaje_exito += (
-                        f"\n\nSe detectaron {len(self.errores_carga)} inconsistencia(s) en los Excel de "
-                        f"origen (filas excluidas del análisis)."
-                    )
+                    if self.errores_carga:
+                        mensaje_exito += (
+                            f"\n\nSe detectaron {len(self.errores_carga)} inconsistencia(s) en los Excel de "
+                            f"origen (filas excluidas del análisis)."
+                        )
+                    if not self.diferencias_brocas.empty:
+                        mensaje_exito += (
+                            f"\n\n{len(self.diferencias_brocas)} turno(s) tienen un avance distinto del total de su "
+                            f"tabla de brocas (netos {self.diferencias_brocas['Diferencia'].sum():+,.2f} m): no se "
+                            f"excluyen, pero hay que corregir esas hojas para que cuadren."
+                        )
                     if archivo_errores:
                         mensaje_exito += f"\nDetalle exportado a:\n{archivo_errores}"
                     else:
@@ -868,7 +971,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 QMessageBox.information(self, "Éxito", mensaje_exito)
                 self.Mensajes.setText(
                     "Reportes Cargados" +
-                    (f" — {len(self.errores_carga)} error(es), ver reporte exportado" if self.errores_carga else "")
+                    (f" — {len(self.errores_carga)} error(es), ver reporte exportado" if self.errores_carga else "") +
+                    (f" — {len(self.diferencias_brocas)} turno(s) con avance distinto de brocas, ver reporte"
+                     if not self.diferencias_brocas.empty else "")
                 )
                 self.CtrlProceso.setEnabled(True)
 
@@ -3631,6 +3736,107 @@ class MyApp(QMainWindow, Ui_MainWindow):
         buf.seek(0)
         return buf
 
+    def _agregar_observaciones_word(self, doc, max_filas_detalle=30):
+        """Apartado final 'Observaciones' del reporte semanal: (1) diferencias de metros contra Almacén
+        (si se cargó) y (2) diferencias entre los metros del reporte y la tabla de brocas: cuadro por mes (con
+        el mismo mes 20-19 de la tabla de brocas, para que se vea de dónde sale cada diferencia) y detalle de los
+        turnos de los 3 meses más recientes. No modifica ningún dato: solo señala qué corregir en el origen."""
+        doc.add_heading('Observaciones', level=1)
+        doc.add_paragraph(
+            "Diferencias detectadas al contrastar los reportes de turno con otras fuentes. Los metros de este "
+            "reporte NO se modificaron: se listan para corregirlos en los reportes de origen o en Almacén."
+        )
+
+        def tabla(columnas, filas):
+            t = doc.add_table(rows=1, cols=len(columnas))
+            t.style = 'Light Grid Accent 1'
+            for c, texto in zip(t.rows[0].cells, columnas):
+                c.text = texto
+            for fila in filas:
+                for c, texto in zip(t.add_row().cells, fila):
+                    c.text = str(texto)
+
+        # 1) Almacén
+        doc.add_heading('1. Diferencias de metros frente a Almacén', level=2)
+        if not hasattr(self, 'almacen_perforacion_equipo'):
+            doc.add_paragraph("No se cargó el Excel de Almacén: no se pudo contrastar los metros por día y máquina.")
+        else:
+            try:
+                validacion = self._validar_metros_vs_almacen()
+            except Exception as e:
+                validacion = pd.DataFrame()
+                doc.add_paragraph(f"No se pudo validar contra Almacén: {e}")
+            diferencias = validacion[validacion['Estado'] == 'DIFERENCIA'] if not validacion.empty else validacion
+            if validacion.empty:
+                pass
+            elif diferencias.empty:
+                doc.add_paragraph("Los metros por día y máquina de los reportes coinciden con Almacén "
+                                  "(diferencias menores a 0.05 m).")
+            else:
+                total = len(validacion)
+                doc.add_paragraph(
+                    f"{len(diferencias)} de {total} combinaciones día-máquina difieren de Almacén en más de 0.05 m "
+                    f"(neto {diferencias['Diferencia'].sum():+,.2f} m; Diferencia = Reportes - Almacén). El detalle "
+                    f"completo está en el Excel de revisión (hojas 'Validacion vs Almacen' y 'Validacion Matriz')."
+                )
+                ordenadas = diferencias.sort_values('Fecha', ascending=False)
+                tabla(['Fecha', 'Máquina', 'Reportes (m)', 'Almacén (m)', 'Diferencia (m)'],
+                      [(r.Fecha.strftime('%d/%m/%Y'), r.Maquina_Reportes, f"{r.Metros_Reportes:,.2f}",
+                        f"{r.Metros_Almacen:,.2f}", f"{r.Diferencia:+,.2f}") for r in ordenadas.head(40).itertuples()])
+                if len(ordenadas) > 40:
+                    doc.add_paragraph(f"Se muestran las 40 más recientes de {len(ordenadas)}.")
+
+        # 2) Reporte vs tabla de brocas
+        doc.add_heading('2. Metros del reporte vs tabla de brocas', level=2)
+        diferencias_brocas = getattr(self, 'diferencias_brocas', None)
+        if diferencias_brocas is None or not hasattr(self, 'df'):
+            doc.add_paragraph("No hay datos para comparar.")
+            return
+        doc.add_paragraph(
+            "El avance de cada turno (celda G9 = Prof. Final - Prof. Inicial) es lo que suman la Curva S, el Excel "
+            "de revisión y los demás gráficos; la tabla de brocas suma, en cambio, el tramo Desde - Hasta registrado "
+            "en la tabla BROCAS de cada hoja. Cuando ambas cifras no coinciden en un turno, el total de la tabla de "
+            "brocas queda distinto de los metros reportados del mismo mes."
+        )
+        df = self.df.copy()
+        df['Mes_Periodo'] = pd.to_datetime(df['Fecha']).map(self._mes_personalizado)
+        por_mes = pd.DataFrame({'Reportes': df.groupby('Mes_Periodo')['Avance Turno'].sum()})
+        resumen_brocas = self._build_resumen_brocas()
+        por_mes['Brocas'] = resumen_brocas.groupby('Mes_Periodo')['Metros'].sum() if not resumen_brocas.empty else 0.0
+        por_mes = por_mes.fillna(0.0)
+        por_mes['Dif'] = por_mes['Reportes'] - por_mes['Brocas']
+        if not diferencias_brocas.empty:
+            por_mes['Turnos'] = diferencias_brocas.groupby('Mes_Periodo').size()
+        por_mes['Turnos'] = por_mes.get('Turnos', 0)
+        por_mes['Turnos'] = por_mes['Turnos'].fillna(0).astype(int)
+        con_diferencia = por_mes[(por_mes['Dif'].abs() > 0.05) | (por_mes['Turnos'] > 0)].sort_index()
+        if con_diferencia.empty:
+            doc.add_paragraph("En todos los meses el total de la tabla de brocas coincide con los metros reportados.")
+            return
+
+        total_dif = con_diferencia['Dif'].sum()
+        doc.add_paragraph(
+            f"Meses con diferencia (mes operativo, igual que la tabla de brocas): neto {total_dif:+,.2f} m en "
+            f"{int(con_diferencia['Turnos'].sum())} turno(s). Diferencia = Reportes - Brocas."
+        )
+        tabla(['Mes', 'Reportes (m)', 'Tabla de brocas (m)', 'Diferencia (m)', 'Turnos con diferencia'],
+              [(p.strftime('%b-%y'), f"{r.Reportes:,.2f}", f"{r.Brocas:,.2f}", f"{r.Dif:+,.2f}", int(r.Turnos))
+               for p, r in con_diferencia.iterrows()])
+
+        recientes = sorted(diferencias_brocas['Mes_Periodo'].unique())[-3:] if not diferencias_brocas.empty else []
+        detalle = diferencias_brocas[diferencias_brocas['Mes_Periodo'].isin(recientes)].copy()
+        if not detalle.empty:
+            detalle['abs'] = detalle['Diferencia'].abs()
+            detalle = detalle.sort_values('abs', ascending=False).head(max_filas_detalle).sort_values('Fecha')
+            doc.add_paragraph(
+                f"Detalle de los turnos de {' y '.join(p.strftime('%b-%y') for p in recientes)} (los de mayor "
+                f"diferencia, máx. {max_filas_detalle}). La lista completa de todos los meses está en el reporte "
+                f"'Errores_Carga_Reportes_*.docx' que se exporta al cargar los reportes."
+            )
+            tabla(['Fecha', 'Máquina', 'Hoja', 'Avance (m)', 'Brocas (m)', 'Dif. (m)', 'Causa probable'],
+                  [(r.Fecha.strftime('%d/%m/%Y'), r.Maquina, r.Hoja, f"{r.Avance_Turno:,.2f}", f"{r.Metros_Brocas:,.2f}",
+                    f"{r.Diferencia:+,.2f}", r.Causa) for r in detalle.itertuples()])
+
     def GenerateWordReport(self):
             self.Mensajes.clear()
             if not DOCX_AVAILABLE:
@@ -3950,6 +4156,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                         )
                 else:
                     doc.add_paragraph("No se encontraron datos de brocas (tabla BROCAS) en los reportes cargados.")
+
+                self._agregar_observaciones_word(doc)
 
                 fecha_hoy = datetime.now().strftime("%Y-%m-%d")
                 default_name = f"Reporte_Semanal_{fecha_hoy}.docx"
