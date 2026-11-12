@@ -120,7 +120,7 @@ _CLAVE_ZONA = "__zona__"  # en ocupacion_vias: ocupación de TODAS las máquinas
 # o ya se perforó; si CUALQUIER fila de una plataforma (gemelos incluidos) tiene uno de estos,
 # esa plataforma no es un punto pendiente.
 PLAN_STATUS_OCUPADO = ("ejecutado", "perforando", "preinicio")
-PLAN_STATUS_DESCARTADO = ("anulad", "cancelad", "descartad", "suspendid")
+PLAN_STATUS_DESCARTADO = ("anulad", "cancelad", "descartad", "suspendid", "abortad")
 # "Plataforma" = plataforma construida esperando máquina: se considera pendiente aunque ya tenga DDHID.
 PLAN_STATUS_PENDIENTE_EXTRA = ("plataforma",)
 # Planos mensuales (como el plano de programa del proyecto): color por mes calendario y forma por máquina.
@@ -2057,7 +2057,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     resumen["Sondaje"] = resumen["Sondaje"].replace("MR25015-11", "MR26015-11")
                     self.BD_Union_total = pd.merge(self.BD_Union, resumen, on="Sondaje", how="left")
                     self.BD_Union_total["Metro_Faltante"] = (self.BD_Union_total["LENGTH"] - self.BD_Union_total["Avance_Actual"]).clip(lower=0)
-                    self.BD_Union_total["Estado"] = self.BD_Union_total["Status"].fillna("Programado")
+                    self.BD_Union_total["Estado"] = self.BD_Union_total["Status"].fillna("Programado").astype(str).str.strip()
+                    # Sondaje ABORTADO (ej. EE-45/MR26060-11 por corte de tubería, EM-47/MR26069-11 por medio ambiente): ya no
+                    # se continúa, así que no tiene metros faltantes; sus metros perforados sí cuentan (vienen de los reportes).
+                    self.BD_Union_total.loc[self.BD_Union_total["Estado"].str.lower() == "abortado", "Metro_Faltante"] = 0.0
                     aviso_externos = self._incorporar_sondajes_externos(file_path)
                     
                     # 2.1 Cálculos de Proyección
@@ -2614,20 +2617,36 @@ class MyApp(QMainWindow, Ui_MainWindow):
         return pd.DataFrame(movimientos)[columnas].sort_values(['Fecha', 'Maquina']).reset_index(drop=True)
 
     def _resumen_taladros(self):
-        """Taladros perforados vs planeados del proyecto, contando por PLATAFORMA (no por
-        Sondaje/DDH): cuando una perforación se detiene por una falla operativa se perfora
-        un "gemelo" desde la MISMA plataforma con otro identificador (ej. "33" y "33B" en
-        Control de Proceso, mismas coordenadas de collar), y ambos deben contar como un solo
-        taladro planeado, no dos — de ahí las plataformas duplicadas que se ven en ese Excel.
-        "Perforados" = plataformas cuyo sondaje (el vigente, no el gemelo abandonado) quedó
-        en estado "Ejecutado". Requiere Control de Proceso cargado (self.BD_Union_total); si
-        no está disponible devuelve None."""
+        """Taladros perforados vs planeados del proyecto, contando por SONDAJE (una fila de la hoja DDH):
+        - Los sondajes ABORTADOS no son puntos planeados ni perforados: ni suman en "planeados" ni en "perforados"
+          (sus metros sí cuentan en el avance, vienen de los reportes). Ej. EM-47/MR26069-11 (abortado por medio
+          ambiente, metros pagados) y EE-45/MR26060-11 (se cortó la tubería y se perforó un gemelo: el gemelo
+          MR26061-11 es el punto planeado de esa plataforma).
+        - Los gemelos que sí se perforaron para obtener muestras (ej. EE-20 y EG-21, 2 sondajes cada una) cuentan
+          cada uno como un punto planeado. Antes se contaba por plataforma y los gemelos contaban una sola vez.
+        "Perforados" = sondajes en estado "Ejecutado". Requiere Control de Proceso cargado (self.BD_Union_total);
+        si no está disponible devuelve None."""
         if not hasattr(self, 'BD_Union_total'):
             return None
-        plataformas = self.BD_Union_total.dropna(subset=['Plataforma'])
-        planeados = plataformas['Plataforma'].nunique()
-        perforados = plataformas.loc[plataformas['Estado'] == 'Ejecutado', 'Plataforma'].nunique()
+        sondajes = self.BD_Union_total.dropna(subset=['Plataforma'])
+        sondajes = sondajes[sondajes['Estado'].astype(str).str.strip().str.lower() != 'abortado']
+        planeados = len(sondajes)
+        perforados = int((sondajes['Estado'].astype(str).str.strip().str.lower() == 'ejecutado').sum())
         return perforados, planeados
+
+    def _detalle_taladros(self):
+        """Detalle para explicar el conteo de _resumen_taladros: sondajes abortados (con sus metros perforados) y
+        plataformas con más de un sondaje contado (gemelos). Devuelve (abortados: DataFrame, gemelos: dict
+        plataforma -> lista de sondajes) o (None, None) si no hay Control de Proceso."""
+        if not hasattr(self, 'BD_Union_total'):
+            return None, None
+        bd = self.BD_Union_total.dropna(subset=['Plataforma']).copy()
+        abortado = bd['Estado'].astype(str).str.strip().str.lower() == 'abortado'
+        abortados = bd.loc[abortado, ['Plataforma', 'Sondaje', 'Avance_Actual']].copy()
+        abortados['Avance_Actual'] = abortados['Avance_Actual'].fillna(0.0)
+        contados = bd[~abortado]
+        gemelos = {plat: list(g['Sondaje'].dropna().astype(str)) for plat, g in contados.groupby('Plataforma') if len(g) > 1}
+        return abortados.reset_index(drop=True), gemelos
 
     def _build_df_plot_plano(self):
         """Prepara df_plot para la Vista en Planta: proyección de días restantes, jittering de
@@ -2764,7 +2783,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 # Ajuste de márgenes: más espacio abajo para la leyenda y derecha para progreso
                 plt.subplots_adjust(right=0.72, top=0.88, left=0.06, bottom=0.15) 
                 ax.set_facecolor('white')
-                color_map = {"Programado": "gray", "Ejecutado": "green", "Perforando": "red", "Plataforma": "orange", "Preinicio": "magenta"}
+                color_map = {"Programado": "gray", "Ejecutado": "green", "Perforando": "red", "Plataforma": "orange", "Preinicio": "magenta",
+                             "Abortado": "black"}
                 
                 ax.grid(True, which='major', color='#EEEEEE', linestyle='-', linewidth=0.8, zorder=0)
                 ax.minorticks_on()
@@ -2776,11 +2796,14 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     sub = df_plot[df_plot["Estado"] == estado].copy()
                     if not sub.empty:
                         # Se grafican los puntos usando las coordenadas con desplazamiento (PLOT)
-                        sc = ax.scatter(sub["ESTE_PLOT"], sub["NORTE_PLOT"], c=color, s=30, lw=0.5, zorder=4, label=estado)
+                        if estado == "Abortado":  # sondaje abortado: se dibuja con una X (sus metros cuentan, no es punto planeado)
+                            sc = ax.scatter(sub["ESTE_PLOT"], sub["NORTE_PLOT"], c=color, s=45, linewidths=1.6, marker='x', zorder=4, label=estado)
+                        else:
+                            sc = ax.scatter(sub["ESTE_PLOT"], sub["NORTE_PLOT"], c=color, s=30, lw=0.5, zorder=4, label=estado)
                         
                         # Las etiquetas de texto se mantienen en la coordenada REAL para no duplicar nombres
                         lbls = []
-                        if estado in ("Perforando", "Preinicio"):
+                        if estado in ("Perforando", "Preinicio", "Abortado"):
                             # Muy pocos sondajes están "Perforando"/"Preinicio" a la vez, así
                             # que aquí SÍ etiquetamos todos con plataforma + máquina (ver
                             # _etiquetar_puntos_plano), en vez de solo el resto de estados
@@ -2837,7 +2860,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 
                 # --- LEYENDA ABAJO Y HORIZONTAL ---
                 leg = ax.legend(loc='upper center', bbox_to_anchor=(0.38, 0.08), bbox_transform=fig.transFigure,
-                                ncol=4, title="Estado (Clic para ocultar)", frameon=True, shadow=True, fontsize=10)
+                                ncol=3, title="Estado (Clic para ocultar)", frameon=True, shadow=True, fontsize=10)
                 map_leg = {leg_line: sc for leg_line, sc in zip(leg.legend_handles, capas_dict.keys())}
                 
                 def on_pick(event):
@@ -3676,7 +3699,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         el resto de estados se distinguen solo por color y la leyenda. El detalle de avance de
         cada sondaje en ejecución se agrega como tabla junto a la imagen (ver GenerateWordReport)."""
         color_map = {"Programado": "gray", "Ejecutado": "green", "Perforando": "red",
-                     "Plataforma": "orange", "Preinicio": "magenta"}
+                     "Plataforma": "orange", "Preinicio": "magenta", "Abortado": "black"}
 
         fig, ax = plt.subplots(figsize=(9, 6))
         plt.subplots_adjust(right=0.97, top=0.90, left=0.10, bottom=0.16)
@@ -3690,15 +3713,18 @@ class MyApp(QMainWindow, Ui_MainWindow):
             sub = df_plot[df_plot["Estado"] == estado]
             if sub.empty:
                 continue
-            ax.scatter(sub["ESTE_PLOT"], sub["NORTE_PLOT"], c=color, s=25, lw=0.5, zorder=4, label=estado)
-            if estado in ("Perforando", "Preinicio"):
+            if estado == "Abortado":
+                ax.scatter(sub["ESTE_PLOT"], sub["NORTE_PLOT"], c=color, s=40, linewidths=1.5, marker='x', zorder=4, label=estado)
+            else:
+                ax.scatter(sub["ESTE_PLOT"], sub["NORTE_PLOT"], c=color, s=25, lw=0.5, zorder=4, label=estado)
+            if estado in ("Perforando", "Preinicio", "Abortado"):
                 # Etiquetamos TODOS los sondajes en Perforando/Preinicio (normalmente muy
                 # pocos a la vez), con plataforma + máquina (ver _etiquetar_puntos_plano);
                 # el resto de estados (Programado/Ejecutado/Plataforma) se dejan sin
                 # etiqueta para que el mapa siga siendo legible con decenas de puntos.
                 self._etiquetar_puntos_plano(ax, sub, fontsize=6.5)
 
-        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.13), ncol=5, title="Estado",
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.13), ncol=6, title="Estado",
                   frameon=True, fontsize=8)
         fig.suptitle("Estado de Perforación - MREDP 2026", fontsize=13, fontweight='bold')
         ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%0.0f'))
@@ -3906,6 +3932,18 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     row = tabla.add_row().cells
                     row[0].text = 'Taladros Perforados'
                     row[1].text = f'{perforados} de {planeados} ({pct_taladros:.0f}%)'
+                    abortados, gemelos = self._detalle_taladros()
+                    if abortados is not None and not abortados.empty:
+                        row = tabla.add_row().cells
+                        row[0].text = 'Sondajes abortados (no planeados)'
+                        row[1].text = '; '.join(f"{r.Plataforma} / {r.Sondaje}: {r.Avance_Actual:,.1f} m"
+                                                for r in abortados.itertuples())
+                    nota = ("Criterio de conteo: cada sondaje planeado cuenta como un taladro. "
+                            + (("Los gemelos cuentan cada uno como punto planeado (" + "; ".join(
+                                f"{plat}: {', '.join(sond)}" for plat, sond in gemelos.items()) + "). ") if gemelos else "")
+                            + ("Los sondajes abortados no son puntos planeados ni perforados, pero sus metros sí suman al "
+                               "avance." if abortados is not None and not abortados.empty else ""))
+                    doc.add_paragraph(nota)
 
                 doc.add_heading('Curva S — Plan vs Real', level=1)
                 doc.add_picture(img_curva, width=Inches(6.3))
@@ -5218,6 +5256,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
             pendientes.loc[pendientes['LENGTH_estimado'], 'LENGTH'] = mediana
             avisos.append(f"{int(pendientes['LENGTH_estimado'].sum())} plataformas sin LENGTH: se asumió {mediana:.0f} m (mediana).")
 
+        abortados = ddh[ddh['Status_norm'].str.startswith("abortad")]
+        if not abortados.empty:
+            avisos.append("Sondajes abortados (sus metros ya cuentan en el avance; no se planifican): " + "; ".join(
+                f"{r['Plataforma']} / {r['DDHID']}" for _, r in abortados.iterrows()))
         externos = getattr(self, 'sondajes_externos', None)
         if externos is not None and not externos.empty:
             avisos.append("Ejecutados sin reporte digital (según Control de Proceso, no se planifican): " + "; ".join(
@@ -5232,9 +5274,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
         for key, grupo in ddh.groupby('Plat_key', sort=False):
             con_coord = grupo.dropna(subset=['ESTE', 'NORTE'])
             base = con_coord.iloc[0] if not con_coord.empty else grupo.iloc[0]
+            todos_abortados = bool(grupo['Status_norm'].map(lambda st: st.startswith("abortad")).all())
             situacion = ("Pendiente" if key in pendientes_keys else "Ejecutada" if key in ejecutadas else
                          f"En curso ({maquina_activa[key]})" if key in maquina_activa else
-                         "En curso" if key in ocupadas else "Descartada")
+                         "En curso" if key in ocupadas else "Abortada" if todos_abortados else "Descartada")
             filas_cat.append({'Plat_key': key, 'Plataforma': base['Plataforma'],
                               'Identificador': ", ".join(i for i in grupo['Identificador'].unique() if i),
                               'Status': base['Status'] or "Programado", 'ESTE': base['ESTE'], 'NORTE': base['NORTE'],
@@ -5626,6 +5669,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 continue
             if cat['Situacion'].startswith("En curso"):
                 descartar(fila, f"La plataforma ya está {cat['Situacion']}", key)
+                continue
+            if cat['Situacion'] in ("Abortada", "Descartada"):
+                descartar(fila, f"La plataforma está {cat['Situacion']}: no es un punto a perforar", key)
                 continue
             if pd.isna(cat['ESTE']) or pd.isna(cat['NORTE']):
                 descartar(fila, "La plataforma no tiene coordenadas ESTE/NORTE", key)
