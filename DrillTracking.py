@@ -924,6 +924,15 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     QMessageBox.critical(self, "Error", mensaje)
                     return
 
+                excluidos_ed = self.df[self.df['Sondaje'].astype(str).str.startswith('ED')]
+                self.excluidos_ed = {'hojas': len(excluidos_ed),
+                                     'metros': float(pd.to_numeric(excluidos_ed['Avance Turno'], errors='coerce').fillna(0).sum()),
+                                     'detalle': (excluidos_ed.assign(**{'Avance Turno': pd.to_numeric(excluidos_ed['Avance Turno'], errors='coerce').fillna(0.0),
+                                                                        'Fecha': pd.to_datetime(excluidos_ed['Fecha'])})
+                                                 .groupby(['Sondaje', 'Maquina'])
+                                                 .agg(Hojas=('Hoja', 'count'), Metros=('Avance Turno', 'sum'), Desde=('Fecha', 'min'),
+                                                      Hasta=('Fecha', 'max'), Programada=('Profundidad Programada', 'max'))
+                                                 .reset_index())}
                 self.df = self.df[~self.df['Sondaje'].astype(str).str.startswith('ED')]
                 self.df = self.df.sort_values("Fecha")
 
@@ -1122,6 +1131,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
     
                     # Guardamos el resultado en el objeto de la clase
                     self.curva_s = curva_s
+                    self._actualizar_revision_con_validacion_almacen()  # la conciliación compara con la Curva S
                     
                     QMessageBox.information(self, "Éxito", "Se importó y procesó correctamente el archivo." + aviso_plan)
                     print(self.curva_s)
@@ -2083,6 +2093,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                                           + (f"\n{aviso_externos.splitlines()[0]}" if aviso_externos else ""))
                     self.PlanPerf.setEnabled(True)
                     self.ruta_ctrl_proceso = file_path  # el planificador relee la hoja DDH (columnas C y W)
+                    self._actualizar_revision_con_validacion_almacen()  # agrega la conciliación de sondajes al revision_*.xlsx
                     self.GenerarPlan.setEnabled(hasattr(self, 'zonas_plan'))
                     self.PlantillaPlan.setEnabled(True)
                     self.CargarPlanManual.setEnabled(hasattr(self, 'zonas_plan'))
@@ -2742,7 +2753,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
             print("Topografía omitida: Ruta no definida o no encontrada.")
         return lineas
 
-    def _etiquetar_puntos_plano(self, ax, sub, fontsize, offset_paso=25):
+    def _etiquetar_puntos_plano(self, ax, sub, fontsize, offset_paso=25, mostrar_avance=False):
         """Etiqueta TODOS los puntos de `sub` (ya filtrado a un solo estado) con su
         plataforma y, si hay una máquina asociada, el nombre de la máquina — separando
         verticalmente los que comparten coordenadas (gemelos perforados por una falla
@@ -2755,7 +2766,11 @@ class MyApp(QMainWindow, Ui_MainWindow):
         agrupamiento se recalcula DENTRO del propio subconjunto de `sub`, así que cada
         estado etiqueta sus propios puntos sin depender de qué otro estado haya tomado el
         primer lugar en esa coordenada. Devuelve la lista de Text creados (para poder
-        mostrarlos/ocultarlos junto con la capa, ver PlotPlano)."""
+        mostrarlos/ocultarlos junto con la capa, ver PlotPlano). Con `mostrar_avance` se agrega, debajo del
+        nombre (plataforma y máquina), el % de avance del sondaje (Avance_Actual / LENGTH) — para los que
+        están en perforación."""
+        if mostrar_avance:
+            offset_paso = max(offset_paso, 38)  # la etiqueta tiene una línea más
         sub = sub.copy()
         sub['n_en_plataforma'] = sub.groupby(['ESTE', 'NORTE'])['Sondaje_fmt'].transform('count')
         sub['idx_en_plataforma'] = sub.groupby(['ESTE', 'NORTE']).cumcount()
@@ -2764,6 +2779,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
             texto = r['Plataforma'] if r['n_en_plataforma'] == 1 else f"{r['Plataforma']} ({r['Sondaje_fmt']})"
             if r['Maquina_fmt'] not in ('S/M', '-', ''):
                 texto += f"\n{r['Maquina_fmt']}"
+            if mostrar_avance and pd.notna(r.get('LENGTH')) and r.get('LENGTH', 0) > 0:
+                avance = r.get('Avance_Actual')
+                texto += f"\n{(avance if pd.notna(avance) else 0.0) / r['LENGTH'] * 100:.0f}%"
             offset_y = r['idx_en_plataforma'] * offset_paso
             txt = ax.text(r["ESTE"] - 12, r["NORTE"] + offset_y, texto, fontsize=fontsize,
                           ha='right', va='center', color='#333333', zorder=5, fontweight='bold')
@@ -2809,7 +2827,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                             # _etiquetar_puntos_plano), en vez de solo el resto de estados
                             # (Programado/Ejecutado/Plataforma, con decenas de puntos) que se
                             # dejan sin etiqueta para que el mapa no se sature.
-                            lbls = self._etiquetar_puntos_plano(ax, sub, fontsize=6)
+                            lbls = self._etiquetar_puntos_plano(ax, sub, fontsize=6, mostrar_avance=(estado == "Perforando"))
                         else:
                             for _, r in sub.iterrows():
                                 # Solo dibujar etiqueta si es el primer sondaje del grupo en esa coordenada para evitar amontonamiento
@@ -3722,7 +3740,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 # pocos a la vez), con plataforma + máquina (ver _etiquetar_puntos_plano);
                 # el resto de estados (Programado/Ejecutado/Plataforma) se dejan sin
                 # etiqueta para que el mapa siga siendo legible con decenas de puntos.
-                self._etiquetar_puntos_plano(ax, sub, fontsize=6.5)
+                self._etiquetar_puntos_plano(ax, sub, fontsize=6.5, mostrar_avance=(estado == "Perforando"))
 
         ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.13), ncol=6, title="Estado",
                   frameon=True, fontsize=8)
@@ -4545,6 +4563,242 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 if isinstance(celda.value, (int, float)):
                     celda.number_format = '0.00'
 
+    def _leer_control_proceso_metros(self):
+        """PROF. EJECUTADA, MAQUINA y COMENTARIOS de la hoja 'Control de Proceso', por Identificador (texto).
+        Se leen por NOMBRE de columna. Devuelve un DataFrame vacío si no se puede leer."""
+        vacio = pd.DataFrame(columns=['PROF. EJECUTADA', 'COMENTARIOS', 'MAQUINA'])
+        ruta = getattr(self, 'ruta_ctrl_proceso', None)
+        if not ruta or not os.path.exists(ruta):
+            return vacio
+        try:
+            cp = pd.read_excel(ruta, sheet_name="Control de Proceso", header=2,
+                               usecols=lambda c: str(c).strip() in ("Identificador", "PROF. EJECUTADA", "COMENTARIOS", "MAQUINA"))
+            cp['_id'] = cp['Identificador'].astype(str).str.strip()
+            return cp.drop_duplicates('_id').set_index('_id')
+        except Exception as e:
+            print(f"No se pudo leer PROF. EJECUTADA de Control de Proceso: {e}")
+            return vacio
+
+    def _construir_conciliacion_sondajes(self, tolerancia=0.1):
+        """Conciliación de metros por sondaje: cruza lo que SUMAN los reportes de turno (self.df, base de la Curva S
+        y del Excel de revisión) contra lo que dice Control de Proceso para cada sondaje/plataforma (PROF. EJECUTADA,
+        estado, metraje descontado, sondajes sin reporte digital) y explica por qué un sondaje suma, suma con
+        descuento o no suma. Devuelve (detalle, sin_control, resumen) — tres DataFrames — o None si falta el
+        Control de Proceso o los reportes.
+          - detalle: una fila por sondaje de Control de Proceso con plataforma.
+          - sin_control: sondajes de los reportes que NO figuran en Control de Proceso (suman igual).
+          - resumen: cómo se llega a los metros netos del proyecto y si cuadran con la Curva S."""
+        if not hasattr(self, 'BD_Union_total') or not hasattr(self, 'df'):
+            return None
+        df = self.df.copy()
+        df['Sondaje'] = df['Sondaje'].astype(str).str.strip().replace({'MR25015-11': 'MR26015-11'})
+        df['Avance Turno'] = pd.to_numeric(df['Avance Turno'], errors='coerce').fillna(0.0)
+        df['Fecha'] = pd.to_datetime(df['Fecha'])
+        df['Prog'] = pd.to_numeric(df['Profundidad Programada'], errors='coerce')
+        por_sondaje = df.groupby('Sondaje').agg(Metros=('Avance Turno', 'sum'), Hojas=('Hoja', 'count'),
+                                                 Desde=('Fecha', 'min'), Hasta=('Fecha', 'max'),
+                                                 Maquinas=('Maquina', lambda x: ", ".join(sorted(set(map(str, x))))))
+
+        # (sondaje, máquina) -> profundidad programada predominante de sus hojas (ponderada por metros)
+        grupos = {}
+        for (sond, maq), g in df.groupby(['Sondaje', 'Maquina']):
+            if g['Avance Turno'].sum() <= 1:
+                continue
+            pesos = g.groupby('Prog')['Avance Turno'].sum()
+            pesos = pesos[pesos.index.notna()]
+            if pesos.empty:
+                continue
+            prog = float(pesos.idxmax())
+            sel = g[g['Prog'] == prog]
+            grupos[(sond, str(maq))] = {'prog': prog, 'metros': float(sel['Avance Turno'].sum()),
+                                        'desde': sel['Fecha'].min(), 'hasta': sel['Fecha'].max()}
+
+        cp = self._leer_control_proceso_metros()
+        externos = getattr(self, 'sondajes_externos', None)
+        externos = {str(r.Sondaje).strip(): r for r in externos.itertuples()} if externos is not None and not externos.empty else {}
+        bd = self.BD_Union_total.dropna(subset=['Plataforma']).copy()
+
+        info = {}  # sondaje -> datos de su fila de Control de Proceso (para buscar candidatos)
+        for _, r in bd.iterrows():
+            sond = str(r['Sondaje']).strip() if pd.notna(r['Sondaje']) else ""
+            if sond:
+                info[sond] = {'plat': r['Plataforma'], 'largo': float(r['LENGTH']) if pd.notna(r['LENGTH']) else np.nan,
+                              'metros': float(por_sondaje['Metros'].get(sond, 0.0)),
+                              'maq': str(cp['MAQUINA'].get(str(r['Identificador']).strip(), "")) if len(cp) else ""}
+
+        def candidatos(prog, excluir, maquina):
+            """Sondajes de Control de Proceso cuyo LENGTH coincide con la profundidad programada de unas hojas y
+            que tienen pocos metros en los reportes (posible destino de hojas mal rotuladas)."""
+            c = [(sd, d) for sd, d in info.items() if sd != excluir and pd.notna(d['largo']) and abs(d['largo'] - prog) <= 0.5
+                 and d['metros'] < d['largo'] * 0.5]
+            con_maquina = [x for x in c if maquina and maquina in x[1]['maq']]
+            return con_maquina or c
+
+        inversas = {}  # candidato -> textos "posible destino de metros rotulados con otro sondaje"
+        filas = []
+        for _, r in bd.iterrows():
+            sond = str(r['Sondaje']).strip() if pd.notna(r['Sondaje']) else ""
+            ident = str(r['Identificador']).strip()
+            estado = str(r['Estado']).strip()
+            est = estado.lower()
+            metros_rep = float(por_sondaje['Metros'].get(sond, 0.0)) if sond else 0.0
+            hojas = int(por_sondaje['Hojas'].get(sond, 0)) if sond else 0
+            maquinas_rep = por_sondaje['Maquinas'].get(sond, "") if sond else ""
+            cp_ej = pd.to_numeric(cp['PROF. EJECUTADA'].get(ident), errors='coerce') if ident in cp.index else np.nan
+            maq_cp = str(cp['MAQUINA'].get(ident, "")) if ident in cp.index else ""
+            maq_cp = "" if maq_cp.lower() == 'nan' else maq_cp
+            descontado = float(r['Metraje Descontado']) if pd.notna(r.get('Metraje Descontado')) else 0.0
+            ext = float(externos[sond].Metros) if sond in externos else 0.0
+            neto = metros_rep + ext - descontado
+            com, revisar = [], False
+
+            if est == 'abortado':
+                com.append("Abortado: sus metros SÍ suman al avance (no es punto planeado).")
+            if ext > 0:
+                e = externos[sond]
+                com.append(f"Sin reporte digital: se suman {ext:,.1f} m tomados de PROF. EJECUTADA de Control de Proceso, "
+                           f"repartidos del {e.Fecha_Inicio:%d/%m/%Y} al {e.Fecha_Fin:%d/%m/%Y} (solo en la Curva S).")
+            if metros_rep == 0 and ext == 0:
+                if est == 'ejecutado':
+                    com.append("Ejecutado pero SIN metros en los reportes cargados: NO suma. Revise si falta cargar su "
+                               "reporte o si sus hojas tienen otro nombre de sondaje.")
+                    revisar = True
+                elif est in ('perforando', 'preinicio'):
+                    com.append("En ejecución, todavía sin metros reportados.")
+                elif est == 'plataforma':
+                    com.append("Plataforma construida, aún sin metros.")
+                elif est != 'abortado':
+                    com.append("Programado: aún sin metros.")
+            elif metros_rep > 0 and est in ('programado', 'plataforma', ''):
+                com.append(f"Tiene {metros_rep:,.1f} m en los reportes aunque su estado es '{estado}': SÍ suman; conviene actualizar el estado.")
+            elif est in ('perforando', 'preinicio') and metros_rep > 0:
+                com.append("En ejecución: suma lo reportado a la fecha.")
+            if descontado > 0:
+                ini, fin = pd.to_datetime(r.get('INICIO.1'), errors='coerce'), pd.to_datetime(r.get('FIN.1'), errors='coerce')
+                rango = f" entre el {min(ini, fin):%d/%m/%Y} y el {max(ini, fin):%d/%m/%Y}" if pd.notna(ini) and pd.notna(fin) else ""
+                com.append(f"Valorización parcial: se descuentan {descontado:,.2f} m de la Curva S{rango} (Metraje Descontado).")
+
+            dif = np.nan
+            if pd.notna(cp_ej) and (sond in por_sondaje.index or ext > 0 or est == 'ejecutado'):
+                dif = metros_rep + ext - float(cp_ej)
+                if abs(dif) > tolerancia:
+                    revisar = True
+                    texto = f"Reportes {metros_rep + ext:,.1f} m vs PROF. EJECUTADA {float(cp_ej):,.1f} m de Control de Proceso (dif {dif:+,.1f} m)."
+                    largo = float(r['LENGTH']) if pd.notna(r['LENGTH']) else np.nan
+                    for (s2, maq), g in grupos.items():
+                        if s2 == sond and pd.notna(largo) and abs(g['prog'] - largo) > 0.5:
+                            cands = candidatos(g['prog'], sond, maq)
+                            pista = (f" Las hojas de {maq} del {g['desde']:%d/%m} al {g['hasta']:%d/%m} ({g['metros']:,.1f} m) rotuladas "
+                                     f"{sond} tienen Profundidad Programada {g['prog']:,.1f} m, distinta del LENGTH de este sondaje "
+                                     f"({largo:,.1f} m)")
+                            if cands:
+                                nombres = ", ".join(f"{sd} ({d['plat']}, LENGTH {d['largo']:,.1f} m, {d['metros']:,.1f} m en reportes)" for sd, d in cands[:3])
+                                pista += f"; coincide con {nombres}: probable error de digitación del sondaje en esas hojas."
+                                for sd, _ in cands[:3]:
+                                    inversas.setdefault(sd, []).append(
+                                        f"Posible destino de {g['metros']:,.1f} m que las hojas de {maq} del {g['desde']:%d/%m} al "
+                                        f"{g['hasta']:%d/%m} rotulan como {sond} (su Profundidad Programada, {g['prog']:,.1f} m, coincide con el LENGTH de este sondaje).")
+                                texto += pista
+                    if est in ('perforando', 'preinicio') and dif > 0:
+                        texto += " En ejecución: es probable que Control de Proceso esté desactualizado."
+                    com.append(texto)
+            elif est == 'ejecutado' and pd.isna(cp_ej) and (metros_rep > 0):
+                com.append("Control de Proceso no tiene PROF. EJECUTADA: no se pudo validar.")
+
+            if ext > 0:
+                se_suma = "SÍ (sin reporte digital)"
+            elif metros_rep == 0:
+                se_suma = "NO"
+            elif descontado > 0:
+                se_suma = "SÍ (con descuento)"
+            else:
+                se_suma = "SÍ"
+            filas.append({'Plataforma': r['Plataforma'], 'Identificador': ident, 'Sondaje': sond or "(sin DDHID)", 'Estado': estado,
+                          'Maquina_Control': maq_cp, 'Maquinas_Reportes': maquinas_rep,
+                          'LENGTH_Programado': float(r['LENGTH']) if pd.notna(r['LENGTH']) else np.nan,
+                          'Hojas_Reportes': hojas, 'Metros_Reportes': round(metros_rep, 2),
+                          'PROF_EJECUTADA_Control': float(cp_ej) if pd.notna(cp_ej) else np.nan,
+                          'Dif_Reportes_vs_Control': round(dif, 2) if pd.notna(dif) else np.nan,
+                          'Metros_Sin_Reporte': round(ext, 2), 'Metraje_Descontado': round(descontado, 2),
+                          'Metros_Netos_Proyecto': round(neto, 2), 'Se_Suma': se_suma,
+                          'Validacion': 'REVISAR' if revisar else 'OK', 'Comentario': " ".join(com)})
+        detalle = pd.DataFrame(filas)
+        for sond, textos in inversas.items():
+            idx = detalle.index[detalle['Sondaje'] == sond]
+            if len(idx):
+                detalle.loc[idx[0], 'Comentario'] = (detalle.loc[idx[0], 'Comentario'] + " " + " ".join(textos)).strip()
+                detalle.loc[idx[0], 'Validacion'] = 'REVISAR'
+        detalle = detalle.sort_values(['Validacion', 'Plataforma', 'Sondaje'], ascending=[False, True, True]).reset_index(drop=True)
+
+        # Sondajes en reportes que no están en Control de Proceso
+        en_control = set(info.keys())
+        faltan = por_sondaje[~por_sondaje.index.isin(en_control)]
+        filas_sc = []
+        import difflib
+        for sond, r in faltan.iterrows():
+            comentario = "No figura en Control de Proceso: SÍ suma a la Curva S (viene de los reportes) pero no se puede validar."
+            parecidos = difflib.get_close_matches(sond, list(en_control), n=2, cutoff=0.85)
+            if parecidos:
+                comentario += f" El nombre se parece a {', '.join(parecidos)}: posible error de digitación."
+            for (s2, maq), g in grupos.items():
+                if s2 == sond:
+                    cands = candidatos(g['prog'], sond, maq)
+                    if cands:
+                        comentario += (f" Las hojas de {maq} ({g['metros']:,.1f} m) tienen Profundidad Programada {g['prog']:,.1f} m: "
+                                       f"posible error de digitación de " + ", ".join(sd for sd, _ in cands[:3]) + ".")
+            filas_sc.append({'Sondaje': sond, 'Maquinas_Reportes': r['Maquinas'], 'Hojas_Reportes': int(r['Hojas']),
+                             'Metros_Reportes': round(float(r['Metros']), 2), 'Desde': r['Desde'].date(), 'Hasta': r['Hasta'].date(),
+                             'Se_Suma': 'SÍ', 'Comentario': comentario})
+        excluidos_ed = getattr(self, 'excluidos_ed', None) or {}
+        if excluidos_ed.get('detalle') is not None and not excluidos_ed['detalle'].empty:
+            for r in excluidos_ed['detalle'].itertuples():
+                filas_sc.append({'Sondaje': r.Sondaje, 'Maquinas_Reportes': r.Maquina, 'Hojas_Reportes': int(r.Hojas),
+                                 'Metros_Reportes': round(float(r.Metros), 2), 'Desde': r.Desde.date(), 'Hasta': r.Hasta.date(),
+                                 'Se_Suma': 'NO (excluido)',
+                                 'Comentario': (f"EXCLUIDO: los sondajes que empiezan con 'ED' no se cargan (regla del aplicativo desde su origen): "
+                                                f"sus {r.Metros:,.1f} m NO suman a la Curva S ni al avance. Profundidad programada en las hojas: "
+                                                f"{r.Programada:,.0f} m. Confirme que no pertenece al proyecto.")})
+        sin_control = pd.DataFrame(filas_sc, columns=['Sondaje', 'Maquinas_Reportes', 'Hojas_Reportes', 'Metros_Reportes',
+                                                      'Desde', 'Hasta', 'Se_Suma', 'Comentario'])
+
+        # Resumen: de los reportes a los metros netos del proyecto
+        total_reportes = float(df['Avance Turno'].sum())
+        en_ctrl = float(detalle['Metros_Reportes'].sum())
+        fuera = float(sin_control.loc[sin_control['Se_Suma'] == 'SÍ', 'Metros_Reportes'].sum()) if not sin_control.empty else 0.0
+        total_desc = float(detalle['Metraje_Descontado'].sum())
+        total_ext = float(detalle['Metros_Sin_Reporte'].sum())
+        netos = total_reportes - total_desc + total_ext
+        filas_r = [
+            ("Metros en los reportes de turno cargados", total_reportes, "Suma de Avance Turno (celda G9): base de la Curva S, del Excel de revisión y de los gráficos."),
+            ("   de sondajes que figuran en Control de Proceso", en_ctrl, f"{int((detalle['Hojas_Reportes'] > 0).sum())} sondajes con metros."),
+            ("   de sondajes que NO figuran en Control de Proceso", fuera, f"{int((sin_control['Se_Suma'] == 'SÍ').sum()) if not sin_control.empty else 0} sondaje(s): ver hoja 'Reportes sin Control'."),
+            ("   Diferencia (debe ser 0)", total_reportes - en_ctrl - fuera, "Si no es 0, hay sondajes que no se pudieron asignar."),
+            ("(-) Metraje descontado (valorización parcial)", -total_desc, "Se resta de la Curva S entre las fechas INICIO.1 / FIN.1 de cada sondaje."),
+            ("(+) Metros sin reporte digital", total_ext, "Perforados por otra área; se toman de PROF. EJECUTADA de Control de Proceso."),
+            ("Metros netos del proyecto (reportes - descuentos + sin reporte)", netos, "Lo que debería indicar el Real acumulado de la Curva S."),
+        ]
+        curva = getattr(self, 'curva_s', None)
+        if curva is not None and 'Real_Acumulado' in curva.columns and curva['Real_Acumulado'].notna().any():
+            fila_c = curva.dropna(subset=['Real_Acumulado']).iloc[-1]
+            real = float(fila_c['Real_Acumulado'])
+            filas_r.append((f"Real acumulado en la Curva S al {pd.Timestamp(fila_c['Fecha']):%d/%m/%Y}", real, "Calculado por la Curva S (LoadPlan)."))
+            dif_c = real - netos
+            filas_r.append(("   Diferencia Curva S vs metros netos", dif_c,
+                            "OK" if abs(dif_c) <= 0.05 else
+                            "Un descuento cuyas fechas caen en días sin reporte cargado no se resta en la Curva S (o hay avance con fecha fuera del rango del plan)."))
+        ed = getattr(self, 'excluidos_ed', None)
+        if ed and ed.get('hojas'):
+            nombres_ed = ", ".join(f"{r.Sondaje} ({r.Maquina})" for r in ed['detalle'].itertuples()) if ed.get('detalle') is not None else ""
+            filas_r.append(("NO SUMAN: sondajes con prefijo 'ED' excluidos", ed['metros'], f"{ed['hojas']} hoja(s) de {nombres_ed}: no se cargan ni suman (ver 'Reportes sin Control')."))
+        if self.errores_carga:
+            filas_r.append(("Hojas excluidas por errores de lectura", float(len(self.errores_carga)), "Cantidad de hojas/archivos con error; sus metros NO suman (ver Errores_Carga_Reportes_*.docx)."))
+        por_estado = detalle.groupby('Estado')['Metros_Netos_Proyecto'].sum()
+        for estado, valor in por_estado.items():
+            filas_r.append((f"Metros netos de sondajes en estado {estado}", float(valor), ""))
+        resumen = pd.DataFrame(filas_r, columns=['Concepto', 'Metros', 'Comentario'])
+        resumen['Metros'] = resumen['Metros'].round(2)
+        return detalle, sin_control, resumen
+
     def _actualizar_revision_con_validacion_almacen(self):
         """(Re)escribe revision_<fecha>.xlsx con la hoja de metros por día/máquina y, si ya
         se cargó el Excel de Almacén (self.almacen_perforacion_equipo), dos hojas más con la
@@ -4559,6 +4813,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
             nombre_archivo = f"revision_{fecha_hoy}.xlsx"
             with pd.ExcelWriter(nombre_archivo, engine='openpyxl') as writer:
                 self.df_final.to_excel(writer, sheet_name='Metros por Dia', index=False)
+                self._escribir_conciliacion_sondajes(writer)
                 if hasattr(self, 'almacen_perforacion_equipo'):
                     validacion = self._validar_metros_vs_almacen()
                     validacion.to_excel(writer, sheet_name='Validacion vs Almacen', index=False)
@@ -4584,6 +4839,42 @@ class MyApp(QMainWindow, Ui_MainWindow):
         except Exception as e:
             traceback.print_exc()
             print(f"No se pudo actualizar '{nombre_archivo}' con la validación vs Almacén: {e}")
+
+    def _escribir_conciliacion_sondajes(self, writer):
+        """Agrega al revision_*.xlsx las hojas de conciliación por sondaje (ver _construir_conciliacion_sondajes)
+        cuando ya se cargó Control de Proceso. Falla en silencio: no debe impedir escribir el resto del archivo."""
+        try:
+            conciliacion = self._construir_conciliacion_sondajes()
+            if conciliacion is None:
+                return
+            from openpyxl.styles import Font, PatternFill, Alignment
+            detalle, sin_control, resumen = conciliacion
+            hojas = (('Sondajes vs Control', detalle), ('Reportes sin Control', sin_control), ('Resumen Metros', resumen))
+            for nombre, tabla in hojas:
+                tabla.to_excel(writer, sheet_name=nombre, index=False)
+                hoja = writer.sheets[nombre]
+                for celda in hoja[1]:
+                    celda.font = Font(bold=True, color='FFFFFF')
+                    celda.fill = PatternFill('solid', fgColor='1F4E78')
+                    celda.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                hoja.freeze_panes = 'A2'
+                titulos = [c.value for c in hoja[1]]
+                for columna in hoja.columns:
+                    titulo = titulos[columna[0].column - 1]
+                    ancho = 95 if titulo == 'Comentario' else max(10, min(34, max(len(str(c.value)) if c.value is not None else 0 for c in columna) + 2))
+                    hoja.column_dimensions[columna[0].column_letter].width = ancho
+                    if titulo == 'Comentario':
+                        for c in columna[1:]:
+                            c.alignment = Alignment(wrap_text=True, vertical='top')
+                if 'Validacion' in titulos:
+                    col_val = titulos.index('Validacion')
+                    for fila in hoja.iter_rows(min_row=2):
+                        if fila[col_val].value == 'REVISAR':
+                            for c in fila:
+                                c.fill = PatternFill('solid', fgColor='FFC7CE')
+        except Exception as e:
+            traceback.print_exc()
+            print(f"No se pudo escribir la conciliación de sondajes: {e}")
 
     def LoadAlmacen(self):
             self.Mensajes.clear()
