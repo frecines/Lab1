@@ -56,6 +56,36 @@ PREFIJOS_SONDAJE_PROYECTO = ("MR",)
 # total de metros de su tabla BROCAS/TRICONO (ver _diferencias_avance_brocas).
 TOLERANCIA_AVANCE_BROCAS_M = 0.1
 
+# Observaciones automáticas de calidad de datos (hojas 'Observaciones' y 'Obs Detalle' del revision_*.xlsx):
+# tipo -> (qué detecta, cómo corregirlo)
+TIPOS_OBSERVACION = {
+    'CORTE_DESIGUAL': ("Una máquina tiene su último reporte varios días antes del corte general: el Real acumulado de esos días no la incluye.",
+                       "Cargar sus reportes hasta el corte, o confirmar que no operó (y marcar su salida en el comentario del turno)."),
+    'SONDAJE_VACIO': ("Hoja de turno sin sondaje (celda G4 vacía).", "Completar el sondaje en la hoja; si no hubo perforación, dejar el avance en 0."),
+    'AVANCE_ATIPICO': ("Avance negativo o mayor a 60 m en un turno.", "Revisar Prof. Inicial / Prof. Final de la hoja."),
+    'SONDAJE_FORMATO': ("El nombre del sondaje no tiene el formato MR#####-##.", "Corregir el nombre en la hoja."),
+    'HOJA_DUPLICADA': ("Dos hojas de la misma máquina, fecha y turno.", "Eliminar o corregir una de las dos."),
+    'HORAS_MAYOR_12': ("Horas cargables + no cargables (Q29 + U38) suman más de 12 h en un turno de 12 h.",
+                       "Revisar las categorías de paradas de la hoja: distorsionan las gráficas de eficiencia y paradas."),
+    'HORAS_MENOR_12': ("Horas cargables + no cargables suman menos de 12 h (o 0 h) en un turno de 12 h.", "Completar las horas de la hoja."),
+    'AVANCE_SIN_HORAS': ("Turno con avance pero 0 h de perforación normal.", "Completar las horas de perforación normal (afecta horas vs metros y eficiencia)."),
+    'AVANCE_VS_BROCAS': ("El avance del turno (G9) no coincide con el total de su tabla BROCAS/TRICONO.",
+                         "Restaurar las fórmulas Desde/Hasta de la broca o corregir la Prof. Final (ver causa probable)."),
+    'DIAS_SIN_REPORTE': ("Varios días seguidos sin ninguna hoja de la máquina dentro de su periodo de trabajo.",
+                         "Si Almacén reporta metros esos días faltan reportes; si no, es una parada."),
+    'DIA_UNA_HOJA': ("Día con una sola hoja de turno (falta DIA o NOCHE).", "Confirmar que la máquina no trabajó el otro turno."),
+    'ALMACEN_DIFERENCIA': ("Metros del día y máquina distintos entre los reportes y Almacén.", "Corregir el reporte o actualizar Almacén."),
+    'CONTROL_VS_REPORTES': ("PROF. EJECUTADA del Control de Proceso distinta de lo que suman los reportes del sondaje.",
+                            "Actualizar Control de Proceso o corregir las hojas (puede haber hojas con otro sondaje)."),
+    'EJECUTADO_SIN_METROS': ("Sondaje en estado Ejecutado sin metros en los reportes cargados.", "Revisar el estado o cargar su reporte."),
+    'EJECUTADO_SIN_FIN': ("Sondaje Ejecutado sin fecha FIN en Control de Proceso.", "Completar INICIO / FIN (columnas Y / Z)."),
+    'FECHAS_CONTROL': ("INICIO/FIN del Control de Proceso se alejan más de 3 días del primer/último avance de los reportes.",
+                       "Corregir las fechas (se usan en descuentos y en sondajes sin reporte digital)."),
+    'SOBRE_LENGTH': ("Los reportes suman más que el LENGTH y que PROF. EJECUTADA del Control.", "Definir cuántos metros se contabilizan y actualizar el Control."),
+    'SONDAJE_NO_EN_CONTROL': ("Sondaje de los reportes que no figura en Control de Proceso (o excluido).", "Corregir el nombre en la hoja o agregarlo al Control."),
+    'PERFORANDO_SIN_REPORTES': ("Sondaje en Perforando sin reportes recientes.", "Actualizar el estado o cargar los reportes."),
+}
+
 OBJETIVO_DIARIO_M = 35  # Metros objetivo por máquina por día
 META_TOTAL_PROYECTO = 28000  # Meta contractual total del proyecto, en metros
 STALE_DAYS = 10  # Días sin reportar avance, sin señales en comentarios, para considerar retirada
@@ -945,9 +975,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
                 self.df_final = self.df_final.fillna(0)
 
-                self._actualizar_revision_con_validacion_almacen()
                 self.df["Fecha"] = pd.to_datetime(self.df["Fecha"])
                 self.machine_lifecycle = self._compute_machine_lifecycle()
+                self._actualizar_revision_con_validacion_almacen()  # después del ciclo de vida: las observaciones lo usan
 
                 print("Datos cargados exitosamente:")
                 print(self.df.head())
@@ -4799,6 +4829,193 @@ class MyApp(QMainWindow, Ui_MainWindow):
         resumen['Metros'] = resumen['Metros'].round(2)
         return detalle, sin_control, resumen
 
+    def _construir_observaciones_datos(self, conciliacion=None):
+        """Revisión automática de calidad de los datos cargados. Devuelve (resumen, detalle): `detalle` tiene un
+        caso por fila (prioridad, tipo, nivel, máquina, sondaje, hoja, fecha, valor y qué revisar) y `resumen` una
+        fila por tipo con cantidad y cómo corregirlo (ver TIPOS_OBSERVACION). Los controles con Control de Proceso
+        se agregan cuando `conciliacion` (ver _construir_conciliacion_sondajes) está disponible; los de Almacén,
+        cuando se cargó ese Excel. No modifica ningún dato."""
+        df = self.df.copy()
+        df['Fecha'] = pd.to_datetime(df['Fecha']).dt.normalize()
+        df['Avance Turno'] = pd.to_numeric(df['Avance Turno'], errors='coerce')
+        df['Avance'] = df['Avance Turno']  # nombre simple para usarlo como atributo en itertuples
+        sondaje_txt = df['Sondaje'].astype(str).str.strip()
+        vacio = df['Sondaje'].isna() | sondaje_txt.isin(['', 'nan', 'NaN', 'None'])
+        obs = []
+
+        def agregar(prioridad, tipo, nivel, detalle, maquina="", plataforma="", sondaje="", archivo="", hoja="", fecha=None,
+                    valor=None, metros=None):
+            obs.append({'Prioridad': prioridad, 'Tipo': tipo, 'Nivel': nivel, 'Maquina': maquina, 'Plataforma': plataforma,
+                        'Sondaje': sondaje, 'Archivo': str(archivo)[9:] if len(str(archivo)) > 9 and str(archivo)[8] == '-' else archivo,
+                        'Hoja': hoja, 'Fecha': fecha.date() if isinstance(fecha, pd.Timestamp) else fecha,
+                        'Valor': valor, 'Metros': metros, 'Detalle': detalle, 'Que_Revisar': TIPOS_OBSERVACION[tipo][1]})
+
+        # --- por máquina: desfase de corte
+        ultimo = df.groupby('Maquina')['Fecha'].max()
+        corte = ultimo.max()
+        ciclo = getattr(self, 'machine_lifecycle', None) or {}
+        for maq, f in ultimo.items():
+            lag = (corte - f).days
+            if lag > 3:
+                retirada = maq in ciclo and ciclo[maq].get('end') is not None
+                agregar('Baja' if retirada else 'Alta', 'CORTE_DESIGUAL', 'Máquina',
+                        f"Último reporte {f:%d/%m/%Y}; el corte general es {corte:%d/%m/%Y} ({lag} días de desfase)"
+                        + (". El aplicativo ya la considera retirada." if retirada else
+                           ": el Real acumulado de esos días no incluye esta máquina."), maquina=maq, fecha=f, valor=lag)
+
+        # --- por hoja
+        for r in df[vacio].itertuples():
+            a = 0.0 if pd.isna(r.Avance) else r.Avance
+            agregar('Alta' if a > 0 else 'Media', 'SONDAJE_VACIO', 'Hoja', f"Hoja sin sondaje (avance {a:,.2f} m).",
+                    maquina=r.Maquina, archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, metros=a)
+        raro = df[~vacio & ~sondaje_txt.str.match(r"^MR\d{5}-\d{2}$")]
+        for r in raro.itertuples():
+            agregar('Media', 'SONDAJE_FORMATO', 'Hoja', f"Sondaje '{r.Sondaje}' fuera del formato MR#####-##.", maquina=r.Maquina,
+                    sondaje=str(r.Sondaje), archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha)
+        for r in df[(df['Avance Turno'] < 0) | (df['Avance Turno'] > 60)].itertuples():
+            agregar('Alta', 'AVANCE_ATIPICO', 'Hoja', f"Avance {r.Avance:,.2f} m en un turno.", maquina=r.Maquina, sondaje=str(r.Sondaje),
+                    archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, valor=r.Avance, metros=r.Avance)
+        turno = df['Turno'].astype(str).str.upper().str.replace('Í', 'I').str.strip()
+        for r in df[df.assign(T=turno).duplicated(['Maquina', 'Fecha', 'T'], keep=False)].itertuples():
+            agregar('Alta', 'HOJA_DUPLICADA', 'Hoja', "Hay otra hoja de la misma máquina, fecha y turno.", maquina=r.Maquina,
+                    sondaje=str(r.Sondaje), archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, metros=r.Avance)
+        horas = df['Horas Paradas'].fillna(0) + df['Horas Operativas'].fillna(0)
+        for r, h in zip(df[horas > 12.5].itertuples(), horas[horas > 12.5]):
+            agregar('Media', 'HORAS_MAYOR_12', 'Hoja', f"Cargables + no cargables = {h:,.1f} h en un turno de 12 h.", maquina=r.Maquina,
+                    sondaje=str(r.Sondaje), archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, valor=round(h, 2))
+        for r, h in zip(df[horas < 11.5].itertuples(), horas[horas < 11.5]):
+            agregar('Alta' if h == 0 and (r.Avance or 0) > 0 else 'Media', 'HORAS_MENOR_12', 'Hoja',
+                    f"Cargables + no cargables = {h:,.1f} h en un turno de 12 h.", maquina=r.Maquina, sondaje=str(r.Sondaje),
+                    archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, valor=round(h, 2))
+        for r in df[(df['Avance Turno'] > 0) & (df['Horas Perforacion Normal'].fillna(0) <= 0)].itertuples():
+            agregar('Media', 'AVANCE_SIN_HORAS', 'Hoja', f"Avance {r.Avance:,.2f} m con 0 h de perforación normal.", maquina=r.Maquina,
+                    sondaje=str(r.Sondaje), archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, metros=r.Avance)
+        try:
+            dif_brocas = self._diferencias_avance_brocas()
+        except Exception:
+            dif_brocas = pd.DataFrame()
+        for r in dif_brocas.itertuples():
+            agregar('Alta' if abs(r.Diferencia) >= 5 else 'Media', 'AVANCE_VS_BROCAS', 'Hoja',
+                    f"Avance {r.Avance_Turno:,.2f} m vs brocas {r.Metros_Brocas:,.2f} m (dif {r.Diferencia:+,.2f}). {r.Causa}",
+                    maquina=r.Maquina, sondaje=str(r.Sondaje), archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, valor=r.Diferencia, metros=r.Diferencia)
+
+        # --- Almacén (si se cargó): días sin hoja, días con una hoja y diferencias
+        validacion = None
+        if hasattr(self, 'almacen_perforacion_equipo'):
+            try:
+                validacion = self._validar_metros_vs_almacen()
+            except Exception:
+                validacion = None
+
+        def metros_almacen(maq, fechas):
+            if validacion is None or validacion.empty:
+                return None
+            v = validacion[(validacion['Maquina_Reportes'] == maq) & (validacion['Fecha'].isin(list(fechas)))]
+            return float(v['Metros_Almacen'].fillna(0).sum()) if not v.empty else 0.0
+
+        for maq, g in df.groupby('Maquina'):
+            dias_con = set(g['Fecha'].unique())
+            todos = pd.date_range(g['Fecha'].min(), g['Fecha'].max())
+            faltan = [d_ for d_ in todos if d_ not in dias_con]
+            # bloques de días consecutivos sin hoja
+            bloques, actual = [], []
+            for d_ in faltan:
+                if actual and (d_ - actual[-1]).days == 1:
+                    actual.append(d_)
+                else:
+                    if actual:
+                        bloques.append(actual)
+                    actual = [d_]
+            if actual:
+                bloques.append(actual)
+            for b_ in [b_ for b_ in bloques if len(b_) >= 2]:
+                alm = metros_almacen(maq, b_)
+                if alm is None:
+                    prio, txt = 'Baja', "Sin Excel de Almacén cargado: confirmar que la máquina estuvo parada."
+                elif alm > 0.05:
+                    prio, txt = 'Alta', f"Almacén reporta {alm:,.1f} m en esos días: FALTAN reportes."
+                else:
+                    prio, txt = 'Baja', "Almacén no reporta metros esos días: parada."
+                agregar(prio, 'DIAS_SIN_REPORTE', 'Máquina', f"{len(b_)} días sin ninguna hoja ({b_[0]:%d/%m/%Y} a {b_[-1]:%d/%m/%Y}). {txt}",
+                        maquina=maq, fecha=b_[0], valor=len(b_), metros=alm)
+            por_dia = g.groupby('Fecha').size()
+            for f in por_dia[por_dia < 2].index:
+                alm = metros_almacen(maq, [f])
+                rep = float(g[g['Fecha'] == f]['Avance Turno'].fillna(0).sum())
+                dif = None if alm is None else round(alm - rep, 2)
+                prio = 'Alta' if dif is not None and abs(dif) > 0.05 else 'Baja'
+                agregar(prio, 'DIA_UNA_HOJA', 'Máquina', "Una sola hoja ese día" + (
+                    f"; Almacén {alm:,.2f} m vs reportes {rep:,.2f} m: " + ("FALTA un turno." if prio == 'Alta' else "coincide.") if alm is not None else "."),
+                        maquina=maq, fecha=f, metros=dif)
+        if validacion is not None and not validacion.empty:
+            for r in validacion[validacion['Estado'] == 'DIFERENCIA'].itertuples():
+                agregar('Alta' if abs(r.Diferencia) >= 10 else 'Media', 'ALMACEN_DIFERENCIA', 'Máquina',
+                        f"Reportes {r.Metros_Reportes:,.2f} m vs Almacén {r.Metros_Almacen:,.2f} m (dif {r.Diferencia:+,.2f}).",
+                        maquina=r.Maquina_Reportes, fecha=r.Fecha, valor=round(r.Diferencia, 2), metros=round(r.Diferencia, 2))
+
+        # --- con Control de Proceso
+        if conciliacion is not None and hasattr(self, 'BD_Union_total'):
+            detalle_c, sin_control, _ = conciliacion
+            for r in detalle_c[detalle_c['Validacion'] == 'REVISAR'].itertuples():
+                if r.Estado.lower() == 'ejecutado' and r.Metros_Reportes == 0 and r.Metros_Sin_Reporte == 0:
+                    agregar('Alta', 'EJECUTADO_SIN_METROS', 'Sondaje', r.Comentario, plataforma=r.Plataforma, sondaje=r.Sondaje, valor=0)
+                if pd.notna(r.Dif_Reportes_vs_Control) and abs(r.Dif_Reportes_vs_Control) > 0.1:
+                    agregar('Alta' if abs(r.Dif_Reportes_vs_Control) >= 10 else 'Media', 'CONTROL_VS_REPORTES', 'Sondaje', r.Comentario,
+                            plataforma=r.Plataforma, sondaje=r.Sondaje, valor=r.Dif_Reportes_vs_Control, metros=r.Dif_Reportes_vs_Control)
+            for r in sin_control.itertuples():
+                agregar('Media', 'SONDAJE_NO_EN_CONTROL', 'Sondaje', r.Comentario, maquina=r.Maquinas_Reportes, sondaje=r.Sondaje,
+                        valor=r.Hojas_Reportes, metros=r.Metros_Reportes)
+            bd = self.BD_Union_total.dropna(subset=['Plataforma'])
+            avance = df[df['Avance Turno'] > 0].groupby(sondaje_txt).agg(ini=('Fecha', 'min'), fin=('Fecha', 'max'))
+            total_sond = df.groupby(sondaje_txt)['Avance Turno'].sum()
+            cp = self._leer_control_proceso_metros()
+            for _, r in bd.iterrows():
+                sond = str(r['Sondaje']).strip() if pd.notna(r['Sondaje']) else ""
+                est = str(r['Estado']).strip().lower()
+                i, f = pd.to_datetime(r.get('INICIO.1'), errors='coerce'), pd.to_datetime(r.get('FIN.1'), errors='coerce')
+                if est == 'ejecutado' and pd.isna(f):
+                    agregar('Media', 'EJECUTADO_SIN_FIN', 'Sondaje', "Estado Ejecutado y la fecha FIN (columna Z) está vacía.",
+                            plataforma=r['Plataforma'], sondaje=sond)
+                if sond in avance.index:
+                    problemas = []
+                    if pd.notna(i) and abs((i - avance.loc[sond, 'ini']).days) > 3:
+                        problemas.append(f"INICIO {i:%d/%m/%Y} vs primer avance {avance.loc[sond, 'ini']:%d/%m/%Y} ({(i - avance.loc[sond, 'ini']).days:+d} d)")
+                    if pd.notna(f) and abs((f - avance.loc[sond, 'fin']).days) > 3:
+                        problemas.append(f"FIN {f:%d/%m/%Y} vs último avance {avance.loc[sond, 'fin']:%d/%m/%Y} ({(f - avance.loc[sond, 'fin']).days:+d} d)")
+                    if problemas:
+                        agregar('Media', 'FECHAS_CONTROL', 'Sondaje', "; ".join(problemas), plataforma=r['Plataforma'], sondaje=sond)
+                    largo = float(r['LENGTH']) if pd.notna(r['LENGTH']) else np.nan
+                    ej = pd.to_numeric(cp['PROF. EJECUTADA'].get(str(r['Identificador']).strip()), errors='coerce') if len(cp) else np.nan
+                    if pd.notna(largo) and total_sond.get(sond, 0) > largo + 0.5 and pd.notna(ej) and ej <= largo + 0.5:
+                        agregar('Media', 'SOBRE_LENGTH', 'Sondaje', f"Reportes {total_sond[sond]:,.2f} m, LENGTH {largo:,.1f} m y PROF. EJECUTADA {ej:,.1f} m: "
+                                f"{total_sond[sond] - largo:,.2f} m por encima del planeado.", plataforma=r['Plataforma'], sondaje=sond,
+                                valor=round(total_sond[sond] - largo, 2), metros=round(total_sond[sond] - largo, 2))
+                if est == 'perforando' and sond:
+                    ult = df[sondaje_txt == sond]['Fecha'].max() if (sondaje_txt == sond).any() else pd.NaT
+                    if pd.isna(ult) or (corte - ult).days > 5:
+                        agregar('Media', 'PERFORANDO_SIN_REPORTES', 'Sondaje',
+                                "Sin hojas en los reportes cargados." if pd.isna(ult) else f"Última hoja {ult:%d/%m/%Y} ({(corte - ult).days} días antes del corte).",
+                                plataforma=r['Plataforma'], sondaje=sond)
+
+        columnas = ['Prioridad', 'Tipo', 'Nivel', 'Maquina', 'Plataforma', 'Sondaje', 'Archivo', 'Hoja', 'Fecha', 'Valor', 'Metros',
+                    'Detalle', 'Que_Revisar']
+        detalle = pd.DataFrame(obs, columns=columnas)
+        orden = {'Alta': 0, 'Media': 1, 'Baja': 2}
+        detalle['_o'] = detalle['Prioridad'].map(orden)
+        detalle = detalle.sort_values(['_o', 'Tipo', 'Maquina', 'Fecha'], na_position='last').drop(columns='_o').reset_index(drop=True)
+        filas = []
+        for tipo, g in detalle.groupby('Tipo'):
+            filas.append({'Prioridad': min(g['Prioridad'], key=lambda p: orden[p]), 'Tipo': tipo, 'Cantidad': len(g),
+                          'Alta': int((g['Prioridad'] == 'Alta').sum()), 'Media': int((g['Prioridad'] == 'Media').sum()),
+                          'Baja': int((g['Prioridad'] == 'Baja').sum()),
+                          'Metros_Afectados': round(float(g['Metros'].fillna(0).sum()), 2),
+                          'Que_Detecta': TIPOS_OBSERVACION[tipo][0], 'Como_Corregirlo': TIPOS_OBSERVACION[tipo][1]})
+        resumen = pd.DataFrame(filas, columns=['Prioridad', 'Tipo', 'Cantidad', 'Alta', 'Media', 'Baja', 'Metros_Afectados', 'Que_Detecta', 'Como_Corregirlo'])
+        if not resumen.empty:
+            resumen['_o'] = resumen['Prioridad'].map(orden)
+            resumen = resumen.sort_values(['_o', 'Cantidad'], ascending=[True, False]).drop(columns='_o').reset_index(drop=True)
+        return resumen, detalle
+
     def _actualizar_revision_con_validacion_almacen(self):
         """(Re)escribe revision_<fecha>.xlsx con la hoja de metros por día/máquina y, si ya
         se cargó el Excel de Almacén (self.almacen_perforacion_equipo), dos hojas más con la
@@ -4841,15 +5058,26 @@ class MyApp(QMainWindow, Ui_MainWindow):
             print(f"No se pudo actualizar '{nombre_archivo}' con la validación vs Almacén: {e}")
 
     def _escribir_conciliacion_sondajes(self, writer):
-        """Agrega al revision_*.xlsx las hojas de conciliación por sondaje (ver _construir_conciliacion_sondajes)
-        cuando ya se cargó Control de Proceso. Falla en silencio: no debe impedir escribir el resto del archivo."""
+        """Agrega al revision_*.xlsx las hojas de observaciones de calidad de datos (siempre que haya reportes) y, cuando
+        ya se cargó Control de Proceso, las de conciliación por sondaje (ver _construir_observaciones_datos y
+        _construir_conciliacion_sondajes). Falla en silencio: no debe impedir escribir el resto del archivo."""
         try:
-            conciliacion = self._construir_conciliacion_sondajes()
-            if conciliacion is None:
-                return
             from openpyxl.styles import Font, PatternFill, Alignment
-            detalle, sin_control, resumen = conciliacion
-            hojas = (('Sondajes vs Control', detalle), ('Reportes sin Control', sin_control), ('Resumen Metros', resumen))
+            conciliacion = None
+            try:
+                conciliacion = self._construir_conciliacion_sondajes()
+            except Exception:
+                traceback.print_exc()
+            hojas = []
+            try:
+                resumen_obs, detalle_obs = self._construir_observaciones_datos(conciliacion)
+                hojas += [('Observaciones', resumen_obs), ('Obs Detalle', detalle_obs)]
+            except Exception:
+                traceback.print_exc()
+            if conciliacion is not None:
+                detalle, sin_control, resumen = conciliacion
+                hojas += [('Sondajes vs Control', detalle), ('Reportes sin Control', sin_control), ('Resumen Metros', resumen)]
+            colores = {'Alta': 'FFC7CE', 'Media': 'FFEB9C', 'Baja': 'E7E6E6'}
             for nombre, tabla in hojas:
                 tabla.to_excel(writer, sheet_name=nombre, index=False)
                 hoja = writer.sheets[nombre]
@@ -4859,22 +5087,33 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     celda.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
                 hoja.freeze_panes = 'A2'
                 titulos = [c.value for c in hoja[1]]
+                anchos_largos = ('Comentario', 'Detalle', 'Que_Revisar', 'Que_Detecta', 'Como_Corregirlo')
                 for columna in hoja.columns:
                     titulo = titulos[columna[0].column - 1]
-                    ancho = 95 if titulo == 'Comentario' else max(10, min(34, max(len(str(c.value)) if c.value is not None else 0 for c in columna) + 2))
+                    ancho = 80 if titulo in anchos_largos else max(10, min(34, max(len(str(c.value)) if c.value is not None else 0 for c in columna) + 2))
                     hoja.column_dimensions[columna[0].column_letter].width = ancho
-                    if titulo == 'Comentario':
+                    if titulo in anchos_largos:
                         for c in columna[1:]:
                             c.alignment = Alignment(wrap_text=True, vertical='top')
+                    if titulo == 'Fecha':
+                        for c in columna[1:]:
+                            c.number_format = 'DD/MM/YYYY'
                 if 'Validacion' in titulos:
                     col_val = titulos.index('Validacion')
                     for fila in hoja.iter_rows(min_row=2):
                         if fila[col_val].value == 'REVISAR':
                             for c in fila:
                                 c.fill = PatternFill('solid', fgColor='FFC7CE')
+                if 'Prioridad' in titulos:
+                    col_p = titulos.index('Prioridad')
+                    for fila in hoja.iter_rows(min_row=2):
+                        if fila[col_p].value in colores:
+                            fila[col_p].fill = PatternFill('solid', fgColor=colores[fila[col_p].value])
+                if nombre == 'Obs Detalle':
+                    hoja.auto_filter.ref = hoja.dimensions
         except Exception as e:
             traceback.print_exc()
-            print(f"No se pudo escribir la conciliación de sondajes: {e}")
+            print(f"No se pudo escribir las observaciones/conciliación: {e}")
 
     def LoadAlmacen(self):
             self.Mensajes.clear()
