@@ -47,6 +47,14 @@ except ImportError:
 # faltan componentes y se cierra (hay que entregar una versión actualizada).
 FECHA_LICENCIA = datetime(2027, 12, 31).date()
 
+# Las observaciones con fecha de referencia hasta este día (incluido) ya fueron pagadas: no se pueden corregir y se
+# dejan solo como registro en la última hoja del revision_*.xlsx ('Obs Pagadas ...').
+FECHA_CIERRE_PAGOS = datetime(2026, 9, 19).date()
+NOMBRE_HOJA_OBS_PAGADAS = f"Obs Pagadas hasta {FECHA_CIERRE_PAGOS:%d-%m-%y}"
+# Máquinas que salieron de perforación: su última hoja reportada es su fecha de salida, así que no se les compara
+# contra la fecha de corte general (CORTE_DESIGUAL). Nombres normalizados (solo A-Z y 0-9).
+MAQUINAS_RETIRADAS_SIN_CORTE = ("HYDX5A05", "HYDX5A06")
+
 # Los sondajes del proyecto se llaman MR##### (ver reportes de turno). Un sondaje ejecutado en
 # Control de Proceso con otro prefijo (ej. GTC26-05, perforado por otra área) no figura en los
 # reportes digitales: sus metros se toman de Control de Proceso (ver _detectar_sondajes_externos).
@@ -61,7 +69,7 @@ TOLERANCIA_AVANCE_BROCAS_M = 0.1
 TIPOS_OBSERVACION = {
     'CORTE_DESIGUAL': ("Una máquina tiene su último reporte varios días antes del corte general: el Real acumulado de esos días no la incluye.",
                        "Cargar sus reportes hasta el corte, o confirmar que no operó (y marcar su salida en el comentario del turno)."),
-    'SONDAJE_VACIO': ("Hoja de turno sin sondaje (celda G4 vacía).", "Completar el sondaje en la hoja; si no hubo perforación, dejar el avance en 0."),
+    'SONDAJE_VACIO': ("Hoja que reporta metros perforados (G9 > 0) sin sondaje (G4) y sin plataforma (A10).", "Completar el sondaje (G4) y la plataforma (A10) en la hoja. Las hojas en blanco sin metros no se observan."),
     'AVANCE_ATIPICO': ("Avance negativo o mayor a 60 m en un turno.", "Revisar Prof. Inicial / Prof. Final de la hoja."),
     'SONDAJE_FORMATO': ("El nombre del sondaje no tiene el formato MR#####-##.", "Corregir el nombre en la hoja."),
     'HOJA_DUPLICADA': ("Dos hojas de la misma máquina, fecha y turno.", "Eliminar o corregir una de las dos."),
@@ -863,6 +871,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                             cat_no_cargables,      # Detalle por categoría no cargable (R16:R37 / U16:U37)
                             detalle_brocas,        # Lista de {diametro,desde,hasta,total} (tabla BROCAS)
                             detalle_tricono,       # Lista de {diametro,desde,hasta,total} (tabla TRICONO)
+                            df_temp.iloc[9, 0],    # A10 ZONA / Plataforma de la hoja (solo para revisión: SONDAJE_VACIO)
                         ])
                     except Exception as e:
                         self._registrar_error_carga(
@@ -892,7 +901,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 columnas = ["Archivo", "Hoja", "Turno", "Maquina", "Sondaje", "Profundidad Programada",
                             "Avance Turno", "Horas Paradas", "Horas Operativas", "Comentario",
                             "Horas Perforacion Normal", "Detalle_Cargables", "Detalle_No_Cargables",
-                            "Detalle_Brocas", "Detalle_Tricono"]
+                            "Detalle_Brocas", "Detalle_Tricono", "Plataforma Hoja"]
 
                 self.df = pd.DataFrame(data_total, columns=columnas)
 
@@ -4860,18 +4869,29 @@ class MyApp(QMainWindow, Ui_MainWindow):
         caso por fila (prioridad, tipo, nivel, máquina, sondaje, hoja, fecha, valor y qué revisar) y `resumen` una
         fila por tipo con cantidad y cómo corregirlo (ver TIPOS_OBSERVACION). Los controles con Control de Proceso
         se agregan cuando `conciliacion` (ver _construir_conciliacion_sondajes) está disponible; los de Almacén,
-        cuando se cargó ese Excel. No modifica ningún dato."""
+        cuando se cargó ese Excel. Las observaciones con fecha hasta FECHA_CIERRE_PAGOS (ya pagadas) no van en
+        `resumen`/`detalle`: se devuelven aparte como tercer valor (`archivadas`) para registrarlas en la última hoja.
+        No modifica ningún dato."""
         df = self.df.copy()
         df['Fecha'] = pd.to_datetime(df['Fecha']).dt.normalize()
         df['Avance Turno'] = pd.to_numeric(df['Avance Turno'], errors='coerce')
         df['Avance'] = df['Avance Turno']  # nombre simple para usarlo como atributo en itertuples
         sondaje_txt = df['Sondaje'].astype(str).str.strip()
         vacio = df['Sondaje'].isna() | sondaje_txt.isin(['', 'nan', 'NaN', 'None'])
+        plat_txt = (df['Plataforma Hoja'] if 'Plataforma Hoja' in df.columns else pd.Series(np.nan, index=df.index)).astype(str).str.strip()
+        plat_vacia = df['Plataforma Hoja'].isna() | plat_txt.isin(['', 'nan', 'NaN', 'None']) if 'Plataforma Hoja' in df.columns else vacio
+        ultima_hoja_sondaje = df[~vacio].groupby(sondaje_txt[~vacio])['Fecha'].max()
         obs = []
 
         def agregar(prioridad, tipo, nivel, detalle, maquina="", plataforma="", sondaje="", archivo="", hoja="", fecha=None,
-                    valor=None, metros=None):
-            obs.append({'Prioridad': prioridad, 'Tipo': tipo, 'Nivel': nivel, 'Maquina': maquina, 'Plataforma': plataforma,
+                    valor=None, metros=None, ref=None):
+            # `ref` = fecha de referencia para decidir si la observación ya fue pagada (ver FECHA_CIERRE_PAGOS):
+            # por defecto la fecha de la observación; en las de sondaje, la fecha de su última hoja.
+            if ref is None:
+                ref = fecha
+            if ref is None and sondaje and sondaje in ultima_hoja_sondaje.index and tipo != 'PERFORANDO_SIN_REPORTES':
+                ref = ultima_hoja_sondaje[sondaje]
+            obs.append({'_ref': pd.Timestamp(ref).date() if ref is not None and not pd.isna(ref) else None,'Prioridad': prioridad, 'Tipo': tipo, 'Nivel': nivel, 'Maquina': maquina, 'Plataforma': plataforma,
                         'Sondaje': sondaje, 'Archivo': str(archivo)[9:] if len(str(archivo)) > 9 and str(archivo)[8] == '-' else archivo,
                         'Hoja': hoja, 'Fecha': fecha.date() if isinstance(fecha, pd.Timestamp) else fecha,
                         'Valor': valor, 'Metros': metros, 'Detalle': detalle, 'Que_Revisar': TIPOS_OBSERVACION[tipo][1]})
@@ -4882,6 +4902,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
         ciclo = getattr(self, 'machine_lifecycle', None) or {}
         for maq, f in ultimo.items():
             lag = (corte - f).days
+            # HYDX-5A-05 / HYDX-5A-06 salieron de perforación: su última hoja es su fecha de salida, no un desfase.
+            if re.sub(r"[^A-Z0-9]", "", str(maq).upper()) in MAQUINAS_RETIRADAS_SIN_CORTE:
+                continue
             if lag > 3:
                 retirada = maq in ciclo and ciclo[maq].get('end') is not None
                 agregar('Baja' if retirada else 'Alta', 'CORTE_DESIGUAL', 'Máquina',
@@ -4890,10 +4913,12 @@ class MyApp(QMainWindow, Ui_MainWindow):
                            ": el Real acumulado de esos días no incluye esta máquina."), maquina=maq, fecha=f, valor=lag)
 
         # --- por hoja
-        for r in df[vacio].itertuples():
-            a = 0.0 if pd.isna(r.Avance) else r.Avance
-            agregar('Alta' if a > 0 else 'Media', 'SONDAJE_VACIO', 'Hoja', f"Hoja sin sondaje (avance {a:,.2f} m).",
-                    maquina=r.Maquina, archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, metros=a)
+        # SONDAJE_VACIO solo cuando la hoja reporta metros perforados (G9 > 0) y no tiene sondaje (G4) ni plataforma (A10);
+        # las hojas en blanco sin metros (equipo que ya salió, turnos sin operar) no se observan.
+        for r in df[vacio & plat_vacia & (df['Avance Turno'] > 0)].itertuples():
+            agregar('Alta', 'SONDAJE_VACIO', 'Hoja',
+                    f"Hoja con {r.Avance:,.2f} m perforados sin sondaje (G4) ni plataforma (A10).",
+                    maquina=r.Maquina, archivo=r.Archivo, hoja=r.Hoja, fecha=r.Fecha, metros=r.Avance)
         raro = df[~vacio & ~sondaje_txt.str.match(r"^MR\d{5}-\d{2}$")]
         for r in raro.itertuples():
             agregar('Media', 'SONDAJE_FORMATO', 'Hoja', f"Sondaje '{r.Sondaje}' fuera del formato MR#####-##.", maquina=r.Maquina,
@@ -5025,10 +5050,14 @@ class MyApp(QMainWindow, Ui_MainWindow):
 
         columnas = ['Prioridad', 'Tipo', 'Nivel', 'Maquina', 'Plataforma', 'Sondaje', 'Archivo', 'Hoja', 'Fecha', 'Valor', 'Metros',
                     'Detalle', 'Que_Revisar']
-        detalle = pd.DataFrame(obs, columns=columnas)
+        todas = pd.DataFrame(obs, columns=['_ref'] + columnas)
         orden = {'Alta': 0, 'Media': 1, 'Baja': 2}
-        detalle['_o'] = detalle['Prioridad'].map(orden)
-        detalle = detalle.sort_values(['_o', 'Tipo', 'Maquina', 'Fecha'], na_position='last').drop(columns='_o').reset_index(drop=True)
+        todas['_o'] = todas['Prioridad'].map(orden)
+        todas = todas.sort_values(['_o', 'Tipo', 'Maquina', 'Fecha'], na_position='last').drop(columns='_o').reset_index(drop=True)
+        # Ya pagadas (fecha de referencia <= FECHA_CIERRE_PAGOS): no se pueden corregir, solo se dejan registradas.
+        pagada = todas['_ref'].apply(lambda d: d is not None and not pd.isna(d) and d <= FECHA_CIERRE_PAGOS)
+        archivadas = todas[pagada].drop(columns='_ref').reset_index(drop=True)
+        detalle = todas[~pagada].drop(columns='_ref').reset_index(drop=True)
         filas = []
         for tipo, g in detalle.groupby('Tipo'):
             filas.append({'Prioridad': min(g['Prioridad'], key=lambda p: orden[p]), 'Tipo': tipo, 'Cantidad': len(g),
@@ -5040,7 +5069,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
         if not resumen.empty:
             resumen['_o'] = resumen['Prioridad'].map(orden)
             resumen = resumen.sort_values(['_o', 'Cantidad'], ascending=[True, False]).drop(columns='_o').reset_index(drop=True)
-        return resumen, detalle
+        return resumen, detalle, archivadas
 
     def _actualizar_revision_con_validacion_almacen(self):
         """(Re)escribe revision_<fecha>.xlsx con la hoja de metros por día/máquina y, si ya
@@ -5079,6 +5108,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                             f"Validación vs Almacén: {n_diferencias} diferencia(s) en '{nombre_archivo}' "
                             f"(ver hoja 'Validacion Matriz')."
                         )
+                self._escribir_obs_pagadas(writer)
         except Exception as e:
             traceback.print_exc()
             print(f"No se pudo actualizar '{nombre_archivo}' con la validación vs Almacén: {e}")
@@ -5095,14 +5125,39 @@ class MyApp(QMainWindow, Ui_MainWindow):
             except Exception:
                 traceback.print_exc()
             hojas = []
+            self.obs_pagadas = None
             try:
-                resumen_obs, detalle_obs = self._construir_observaciones_datos(conciliacion)
+                resumen_obs, detalle_obs, self.obs_pagadas = self._construir_observaciones_datos(conciliacion)
                 hojas += [('Observaciones', resumen_obs), ('Obs Detalle', detalle_obs)]
             except Exception:
                 traceback.print_exc()
             if conciliacion is not None:
                 detalle, sin_control, resumen = conciliacion
                 hojas += [('Sondajes vs Control', detalle), ('Reportes sin Control', sin_control), ('Resumen Metros', resumen)]
+            self._formatear_hojas_revision(writer, hojas)
+        except Exception as e:
+            traceback.print_exc()
+            print(f"No se pudo escribir las observaciones/conciliación: {e}")
+
+    def _escribir_obs_pagadas(self, writer):
+        """Última hoja del revision_*.xlsx: observaciones con fecha hasta FECHA_CIERRE_PAGOS (ya pagadas). Solo registro:
+        no se pueden cambiar. Se llama después de todas las demás hojas para que quede al final."""
+        try:
+            pagadas = getattr(self, 'obs_pagadas', None)
+            if pagadas is None:
+                return
+            self._formatear_hojas_revision(writer, [(NOMBRE_HOJA_OBS_PAGADAS, pagadas)])
+            hoja = writer.sheets[NOMBRE_HOJA_OBS_PAGADAS]
+            if len(pagadas):
+                hoja.auto_filter.ref = hoja.dimensions
+        except Exception as e:
+            traceback.print_exc()
+            print(f"No se pudo escribir la hoja de observaciones pagadas: {e}")
+
+    def _formatear_hojas_revision(self, writer, hojas):
+        """Escribe cada (nombre, tabla) de `hojas` en el libro con el formato común del revision_*.xlsx."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        try:
             colores = {'Alta': 'FFC7CE', 'Media': 'FFEB9C', 'Baja': 'E7E6E6'}
             for nombre, tabla in hojas:
                 tabla.to_excel(writer, sheet_name=nombre, index=False)
@@ -5139,7 +5194,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     hoja.auto_filter.ref = hoja.dimensions
         except Exception as e:
             traceback.print_exc()
-            print(f"No se pudo escribir las observaciones/conciliación: {e}")
+            print(f"No se pudo dar formato a las hojas del revision: {e}")
 
     def LoadAlmacen(self):
             self.Mensajes.clear()
