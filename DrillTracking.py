@@ -65,7 +65,8 @@ TIPOS_OBSERVACION = {
     'AVANCE_ATIPICO': ("Avance negativo o mayor a 60 m en un turno.", "Revisar Prof. Inicial / Prof. Final de la hoja."),
     'SONDAJE_FORMATO': ("El nombre del sondaje no tiene el formato MR#####-##.", "Corregir el nombre en la hoja."),
     'HOJA_DUPLICADA': ("Dos hojas de la misma máquina, fecha y turno.", "Eliminar o corregir una de las dos."),
-    'HORAS_MAYOR_12': ("Horas cargables + no cargables (Q29 + U38) suman más de 12 h en un turno de 12 h.",
+    'HORAS_MAYOR_12': ("Horas cargables + no cargables suman más de 12 h en un turno de 12 h (ya se descuenta Q29 cuando U38 lo incluye, "
+                       "según la plantilla de la hoja).",
                        "Revisar las categorías de paradas de la hoja: distorsionan las gráficas de eficiencia y paradas."),
     'HORAS_MENOR_12': ("Horas cargables + no cargables suman menos de 12 h (o 0 h) en un turno de 12 h.", "Completar las horas de la hoja."),
     'AVANCE_SIN_HORAS': ("Turno con avance pero 0 h de perforación normal.", "Completar las horas de perforación normal (afecta horas vs metros y eficiencia)."),
@@ -609,6 +610,30 @@ class MyApp(QMainWindow, Ui_MainWindow):
         valores = valores[valores != ""]
         return sorted(valores.unique())
 
+    def _normalizar_horas_turno(self, df):
+        """Deja 'Horas Operativas' = horas NO cargables del turno (incluida la perforación normal), SIN las horas
+        cargables (Q29), que es lo que asumen las gráficas de eficiencia y paradas (total del turno = Q29 + Operativas).
+        Hay dos versiones de la plantilla del reporte de turno:
+          - Anterior: U38 'TOTAL HORAS' = SUM(U14, U16:U37...) -> NO incluye Q29.
+          - Nueva (desde ~ago/sep-2026): U38 = SUM(U14, U16:U29, ..., Q29) -> YA incluye Q29.
+        Sumar Q29 + U38 en la nueva contaba las horas cargables dos veces (ej. 9 + 12 = 21 h en un turno de 12 h) y
+        distorsionaba la eficiencia y las paradas. Se reconoce la versión de cada hoja comparando U38 con la suma
+        de sus detalles (U14 + R16:U37): si U38 = detalles + Q29 incluye las cargables. El valor original de U38 se
+        conserva en 'Horas U38 Original' y la marca en 'U38 Incluye Cargables'."""
+        q = pd.to_numeric(df['Horas Paradas'], errors='coerce').fillna(0.0)
+        u = pd.to_numeric(df['Horas Operativas'], errors='coerce').fillna(0.0)
+        pn = pd.to_numeric(df['Horas Perforacion Normal'], errors='coerce').fillna(0.0)
+        detalles = df['Detalle_No_Cargables'].map(
+            lambda x: float(sum(v for v in x.values() if pd.notna(v))) if isinstance(x, dict) else 0.0)
+        resto = u - (pn + detalles)
+        incluye = (q > 0) & ((resto - q).abs() <= 0.06) & (resto.abs() > 0.06)
+        df = df.copy()
+        df['Horas U38 Original'] = df['Horas Operativas']
+        df['U38 Incluye Cargables'] = incluye
+        df['Horas Operativas'] = df['Horas Operativas'].astype(float)
+        df.loc[incluye, 'Horas Operativas'] = (u - q)[incluye]
+        return df
+
     def _diferencias_avance_brocas(self, tolerancia=TOLERANCIA_AVANCE_BROCAS_M):
         """Turnos cuyo AVANCE (celda G9: Prof. Final - Prof. Inicial, lo que suma el Excel de revisión) no
         coincide con los metros de su tabla BROCAS/TRICONO (lo que suma la tabla de brocas del Word). Las
@@ -831,7 +856,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                             df_temp.iloc[9, 6],   # Prof Programada
                             df_temp.iloc[8, 6],   # Avance
                             df_temp.iloc[28, 16], # Hrs Paradas (Horas Operativas Cargables, Q29)
-                            df_temp.iloc[37, 20], # Hrs Operativas (Horas no Cargables, U38 - incluye Perf. Normal)
+                            df_temp.iloc[37, 20], # U38 TOTAL HORAS (no cargables incl. Perf. Normal; en la plantilla nueva incluye además Q29 -> ver _normalizar_horas_turno)
                             df_temp.iloc[3, 14],  # Comentario de turno (O4)
                             horas_perf_normal,     # Horas Perforacion Normal (U14)
                             cat_cargables,         # Detalle por categoría cargable (N14:N28 / Q14:Q28)
@@ -954,6 +979,7 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     QMessageBox.critical(self, "Error", mensaje)
                     return
 
+                self.df = self._normalizar_horas_turno(self.df)
                 excluidos_ed = self.df[self.df['Sondaje'].astype(str).str.startswith('ED')]
                 self.excluidos_ed = {'hojas': len(excluidos_ed),
                                      'metros': float(pd.to_numeric(excluidos_ed['Avance Turno'], errors='coerce').fillna(0).sum()),
@@ -4493,12 +4519,12 @@ class MyApp(QMainWindow, Ui_MainWindow):
         for a in nombres_a:
             if a in resultado:
                 continue
-            a_norm = _strip_accents(a).upper().replace(" ", "")
+            a_norm = re.sub(r"[^A-Z0-9]", "", _strip_accents(a).upper())  # 'H-600' == 'H600' == 'H 600'
             mejor = None
             for b in nombres_b:
                 if b in usados_b:
                     continue
-                b_norm = _strip_accents(b).upper().replace(" ", "")
+                b_norm = re.sub(r"[^A-Z0-9]", "", _strip_accents(b).upper())
                 if a_norm and b_norm and (a_norm in b_norm or b_norm in a_norm):
                     mejor = b
                     break
