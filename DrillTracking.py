@@ -513,6 +513,24 @@ class MyApp(QMainWindow, Ui_MainWindow):
                     mejor_largo = len(prefijo_norm)
         return mejor_nombre
 
+    def _valor_total_horas(self, df_temp, col_label, col_valor, fila_desde, fila_hasta, fila_fija):
+        """Valor de la celda 'TOTAL HORAS' de un bloque del resumen de horas (cargables: etiqueta en N, valor en Q;
+        no cargables: etiqueta en R, valor en U). Se busca por la etiqueta entre `fila_desde` y `fila_hasta` (filas de
+        Excel, 1-based) porque algunas hojas tienen una fila de la plantilla eliminada y el total queda una fila más
+        arriba (U37/Q28 en vez de U38/Q29): leer la celda fija daba 0 h en hojas que sí tienen horas. Si no se
+        encuentra la etiqueta se usa la celda fija `fila_fija` (1-based)."""
+        n_filas, n_cols = df_temp.shape
+        if col_label < n_cols and col_valor < n_cols:
+            for fila_excel in range(fila_desde, fila_hasta + 1):
+                i = fila_excel - 1
+                if i >= n_filas:
+                    break
+                etiqueta = df_temp.iat[i, col_label]
+                if pd.notna(etiqueta) and self._normalizar_para_match(str(etiqueta)).startswith("total horas"):
+                    return df_temp.iat[i, col_valor]
+        i = fila_fija - 1
+        return df_temp.iat[i, col_valor] if i < n_filas and col_valor < n_cols else np.nan
+
     def _extraer_categoria_paradas(self, df_temp, fila_inicio, fila_fin, col_label, col_valor,
                                     categorias_canonicas, archivo, hoja, excluir_labels=()):
         """Lee pares (etiqueta, horas) fila a fila entre `fila_inicio` y `fila_fin` (números
@@ -533,6 +551,9 @@ class MyApp(QMainWindow, Ui_MainWindow):
                 continue
             etiqueta = " ".join(str(etiqueta).split())
             if not etiqueta or etiqueta in excluir_labels:
+                continue
+            # El 'TOTAL HORAS' no es una categoría: en hojas con una fila de plantilla eliminada cae dentro del rango.
+            if self._normalizar_para_match(etiqueta).startswith("total horas"):
                 continue
             valor = df_temp.iat[i, col_valor] if col_valor < n_cols else np.nan
             valor = pd.to_numeric(valor, errors="coerce")
@@ -863,8 +884,8 @@ class MyApp(QMainWindow, Ui_MainWindow):
                             df_temp.iloc[3, 6],   # Sondaje
                             df_temp.iloc[9, 6],   # Prof Programada
                             df_temp.iloc[8, 6],   # Avance
-                            df_temp.iloc[28, 16], # Hrs Paradas (Horas Operativas Cargables, Q29)
-                            df_temp.iloc[37, 20], # U38 TOTAL HORAS (no cargables incl. Perf. Normal; en la plantilla nueva incluye además Q29 -> ver _normalizar_horas_turno)
+                            self._valor_total_horas(df_temp, 13, 16, 22, 36, 29), # Hrs Paradas (Horas Operativas Cargables, Q29; Q28 si la hoja tiene una fila menos)
+                            self._valor_total_horas(df_temp, 17, 20, 30, 45, 38), # U38 TOTAL HORAS (U37 si la hoja tiene una fila menos) (no cargables incl. Perf. Normal; en la plantilla nueva incluye además Q29 -> ver _normalizar_horas_turno)
                             df_temp.iloc[3, 14],  # Comentario de turno (O4)
                             horas_perf_normal,     # Horas Perforacion Normal (U14)
                             cat_cargables,         # Detalle por categoría cargable (N14:N28 / Q14:Q28)
@@ -5055,9 +5076,10 @@ class MyApp(QMainWindow, Ui_MainWindow):
         todas['_o'] = todas['Prioridad'].map(orden)
         todas = todas.sort_values(['_o', 'Tipo', 'Maquina', 'Fecha'], na_position='last').drop(columns='_o').reset_index(drop=True)
         # Ya pagadas (fecha de referencia <= FECHA_CIERRE_PAGOS): no se pueden corregir, solo se dejan registradas.
-        pagada = todas['_ref'].apply(lambda d: d is not None and not pd.isna(d) and d <= FECHA_CIERRE_PAGOS)
-        archivadas = todas[pagada].drop(columns='_ref').reset_index(drop=True)
-        detalle = todas[~pagada].drop(columns='_ref').reset_index(drop=True)
+        pagada = pd.Series([d is not None and not pd.isna(d) and d <= FECHA_CIERRE_PAGOS for d in todas['_ref']],
+                           index=todas.index, dtype=bool)
+        archivadas = todas.loc[pagada].drop(columns='_ref').reset_index(drop=True)
+        detalle = todas.loc[~pagada].drop(columns='_ref').reset_index(drop=True)
         filas = []
         for tipo, g in detalle.groupby('Tipo'):
             filas.append({'Prioridad': min(g['Prioridad'], key=lambda p: orden[p]), 'Tipo': tipo, 'Cantidad': len(g),
